@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "awstorage"
+version = "0.1.0"
+description = "Scan a drive, get a ranked inventory of what fills it, classified re-fetchable or not, diffed against last time -- before you delete anything."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+# Deliberately stdlib-only. A storage inventory tool that cannot run on the box
+# whose disk is full -- because pip cannot fetch its dependencies onto a full disk --
+# is the one tool that must have none.
+dependencies = []
+
+[project.optional-dependencies]
+# awrecover turns "delete" into "snapshot, then delete"; optional so the scan
+# and the inventory never depend on a sibling (the lego rule).
+recover = ["awrecover>=0.1.0"]
+yaml = ["pyyaml>=6.0"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+awstorage = "awstorage.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Aitherium/awstorage"
+Repository = "https://github.com/Aitherium/awstorage.git"
+
+[tool.setuptools]
+packages = ["awstorage", "awstorage.collectors"]
+license-files = ["LICENSE"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

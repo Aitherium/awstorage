@@ -1,0 +1,28 @@
+{
+  "schemaVersion": "1",
+  "name": "awstorage",
+  "description": "Every drive on every node, indexed, classified and diffed -- so you can see what you own before you delete it.",
+  "url": "https://aitherium.github.io/awstorage/",
+  "repository": "https://github.com/Aitherium/awstorage",
+  "kind": "tool",
+  "status": "planned",
+  "adopt": "Scan one drive and read a ranked inventory of what fills it, with each tree marked re-fetchable or not.",
+  "pairs_with": [
+    "awrecover",
+    "awdk",
+    "awnode",
+    "awsh",
+    "awgraph"
+  ],
+  "includes": [],
+  "metrics": {
+    "files": {
+      "value": 10,
+      "as_of": "2026-09-01T22:40:00-07:00"
+    },
+    "tests": {
+      "value": 14,
+      "as_of": "2026-09-01T22:40:00-07:00"
+    }
+  }
+}
