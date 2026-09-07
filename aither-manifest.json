@@ -5,7 +5,7 @@
   "url": "https://aitherium.github.io/awstorage/",
   "repository": "https://github.com/Aitherium/awstorage",
   "kind": "tool",
-  "status": "public",
+  "status": "planned",
   "adopt": "Scan one drive and read a ranked inventory of what fills it, with each tree marked re-fetchable or not.",
   "pairs_with": [
     "awrecover",
@@ -17,12 +17,12 @@
   "includes": [],
   "metrics": {
     "files": {
-      "value": 24,
-      "as_of": "2026-09-06T20:00:41-07:00"
+      "value": 10,
+      "as_of": "2026-09-01T22:40:00-07:00"
     },
     "tests": {
-      "value": 4,
-      "as_of": "2026-09-06T20:00:41-07:00"
+      "value": 14,
+      "as_of": "2026-09-01T22:40:00-07:00"
     }
   }
 }

@@ -281,24 +281,24 @@ def test_cli_end_to_end(tree: Path, tmp_path: Path, capsys):
 def test_build_output_inside_a_git_repo_is_never_auto(tmp_path: Path):
     """Tenant repos `git add -f` their dist/; a build-temp rule must not auto-delete it."""
     root = tmp_path / "vol"
-    _mk(root, "repos/tenant-a/.git/HEAD", 10)
-    _mk(root, "repos/tenant-a/dist/bundle.js", 8192, age_days=30)
+    _mk(root, "repos/acme/.git/HEAD", 10)
+    _mk(root, "repos/acme/dist/bundle.js", 8192, age_days=30)
     _mk(root, "scratch/dist/out.o", 8192, age_days=30)
     snap = awstorage.classify_snapshot(awstorage.scan(root, max_depth=3, node="t"))
     by = {t["path"]: t for t in snap["trees"]}
-    assert by[snap["root"] + "/repos/tenant-a"]["git"] is True
+    assert by[snap["root"] + "/repos/acme"]["git"] is True
     assert by[snap["root"] + "/scratch"]["git"] is False
     props = {p.path.rsplit("/", 2)[-2] + "/" + p.path.rsplit("/", 1)[-1]: p
              for p in awstorage.propose(snap, _policy_min1())}
-    assert props["tenant-a/dist"].auto is False
-    assert "git working tree" in props["tenant-a/dist"].note
+    assert props["acme/dist"].auto is False
+    assert "git working tree" in props["acme/dist"].note
     assert props["scratch/dist"].auto is True
     # The flag survives the catalog round trip, so proposing from a stored snapshot
     # reaches the same verdict as proposing from a live one.
     cat = awstorage.Catalog(tmp_path / "c.db")
     back = cat.get_snapshot(cat.put_snapshot(snap))
     again = {p.path: p.auto for p in awstorage.propose(back, _policy_min1())}
-    assert again[snap["root"] + "/repos/tenant-a/dist"] is False
+    assert again[snap["root"] + "/repos/acme/dist"] is False
     assert again[snap["root"] + "/scratch/dist"] is True
     cat.close()
 
@@ -326,15 +326,15 @@ def test_apply_refuses_inside_a_git_working_tree_even_for_a_stale_auto_proposal(
     """2026-09-02: proposals written before the scanner recorded `.git` quarantined four
     tenant repos' tracked dist/ trees. The guard must live at APPLY time, on the disk."""
     root = tmp_path / "vol"
-    _mk(root, "repos/tenant-a/dist/bundle.js", 8192, age_days=30)
+    _mk(root, "repos/acme/dist/bundle.js", 8192, age_days=30)
     snap = awstorage.classify_snapshot(awstorage.scan(root, max_depth=3, node="t"))
     dist = next(p for p in awstorage.propose(snap, _policy_min1()) if p.path.endswith("/dist"))
     assert dist.auto is True  # no .git yet -> the policy pre-approves it
     # The repo appears AFTER the proposal was written (or the scan predates the flag).
-    _mk(root, "repos/tenant-a/.git/HEAD", 10)
+    _mk(root, "repos/acme/.git/HEAD", 10)
     with pytest.raises(ApplyRefused, match="git working tree"):
         awstorage.apply(dist, roots=[root], dry_run=False, verify_fingerprint=False)
-    assert (root / "repos" / "tenant-a" / "dist" / "bundle.js").exists()
+    assert (root / "repos" / "acme" / "dist" / "bundle.js").exists()
     # A human's explicit approval still goes through (and is what the card answers).
     r = awstorage.apply(dist, roots=[root], dry_run=False, verify_fingerprint=False, approved=True)
     assert r["outcome"] == "applied"
@@ -345,7 +345,7 @@ def test_apply_refuses_inside_a_git_working_tree_even_for_a_stale_auto_proposal(
     _mk(root2, ".git/HEAD", 10)
     _mk(root2, "scratch/dist/out.o", 8192, age_days=30)
     assert _git_ancestor(root2 / "scratch" / "dist", [root2]) is None
-    assert _git_ancestor(root / "repos" / "tenant-a" / "dist", [root]) is not None
+    assert _git_ancestor(root / "repos" / "acme" / "dist", [root]) is not None
 
 
 def test_self_test_passes():

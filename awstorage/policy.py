@@ -137,7 +137,7 @@ def propose(snapshot: dict, policy: dict | None = None, *, now: float | None = N
         keep.append(p)
     # Trees the scanner saw a `.git` in. A build output INSIDE a working tree may be
     # tracked content (tenant repos `git add -f` their dist/; measured 2026-09-01 on
-    # a tenant repo's dist/), so nothing under one is ever pre-approved.
+    # E:/repos/acme-project/dist), so nothing under one is ever pre-approved.
     repo_roots = [t["path"].rstrip("/") + "/" for t in trees if t.get("git")]
     out: list[Proposal] = []
     for p in keep:
