@@ -2,7 +2,7 @@
 
 <!-- aither-header:start GENERATED from the ecosystem registry. Edits here are overwritten; change the registry instead. -->
 
-**[Docs](https://aitherium.github.io/awstorage/)**  ·  [Source](https://github.com/Aitherium/awstorage)  ·  `pip install awstorage`  ·  [The Aither World](https://aitherium.github.io/)
+**[Docs](https://aitherium.github.io/awstorage/)**  ·  [Source](https://github.com/Aitherium/awstorage)  ·  [The Aither World](https://aitherium.github.io/)
 
 > **The Aither World** is an operating system for agents — a Linux you can hand to one, the runtimes it works in, and the tools it works with. [awnix](https://github.com/Aitherium/awnix) is the Linux underneath it; **awstorage** is one of its 46 bricks — each installs on its own, runs offline, and needs no account.
 >
