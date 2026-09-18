@@ -371,6 +371,20 @@ def self_test() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # GENERATED doctor intercept (gen_aw_doctor.py) -- do not edit
+    _dv = locals().get("argv")
+    if (_dv if _dv is not None else __import__("sys").argv[1:])[:1] == ["doctor"]:
+        from ._doctor import report
+        return report()
+    # GENERATED repo-state intercept (gen_aw_doctor.py) -- do not edit
+    try:
+        from awgit import state as _aw_state
+    except Exception:
+        _aw_state = None
+    if _aw_state is not None:
+        _sv = locals().get("argv")
+        if _aw_state.cli_banner(_sv if _sv is not None else __import__("sys").argv[1:]):
+            return 0
     ap = argparse.ArgumentParser(prog="awstorage", description=__doc__.split("\n\n")[0])
     ap.add_argument("--version", action="version", version=f"awstorage {__version__}")
     ap.add_argument("--self-test", action="store_true", help="prove the tool can still fail")
