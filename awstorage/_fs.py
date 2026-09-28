@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import os
 import socket
+import stat
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -143,7 +144,9 @@ def scan(
         with it:
             for e in it:
                 try:
-                    if e.is_symlink() and not follow_symlinks:
+                    if not follow_symlinks and entry_is_link(e):
+                        # Junctions too: before 3.12 is_symlink() says False for
+                        # one, and its target's bytes are not this tree's bytes.
                         continue
                     if e.is_dir(follow_symlinks=follow_symlinks):
                         if e.name == ".git" and owners[-1] in agg:
@@ -199,6 +202,171 @@ def scan(
         "error_count": len(errors),
         "elapsed_s": round(time.monotonic() - t0, 2),
     }
+
+
+# -- links: never followed, never recursed, only ever unlinked -------------------
+#
+# A Windows JUNCTION is not a symlink to Python before 3.12: `is_symlink()` is
+# False, `os.walk(followlinks=False)` descends into it, and a hand-rolled
+# recursive delete walks straight into the TARGET. A scratch tree that holds a
+# junction to a real checkout (agents make them for node_modules) would then take
+# the checkout with it. So every destructive walk in this package asks
+# `is_link()`, which answers True for a symlink, a junction, or any other reparse
+# point, and treats the answer as "remove the link itself, never its contents".
+
+_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+
+def _stat_is_link(st: os.stat_result) -> bool:
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    return bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT)
+
+
+def is_link(path: str | os.PathLike) -> bool:
+    """True for a symlink, a Windows junction, or any reparse point. Never follows."""
+    isj = getattr(os.path, "isjunction", None)  # 3.12+
+    try:
+        if os.path.islink(path) or (isj is not None and isj(path)):
+            return True
+        return _stat_is_link(os.lstat(path))
+    except OSError:
+        return False
+
+
+def entry_is_link(e: os.DirEntry) -> bool:
+    """`is_link` for a scandir entry, without a second stat on POSIX."""
+    try:
+        if e.is_symlink():
+            return True
+        isj = getattr(e, "is_junction", None)  # 3.12+
+        if isj is not None and isj():
+            return True
+        return _stat_is_link(e.stat(follow_symlinks=False))
+    except OSError:
+        return False
+
+
+def long_path(p: str | os.PathLike) -> str:
+    """Windows extended-length spelling (\\\\?\\) so a 300-char scratch path can be
+    removed at all; identity elsewhere. Agent review trees nest node_modules inside
+    copies of repos -- MAX_PATH is not hypothetical there."""
+    s = os.path.abspath(os.fspath(p))
+    if os.name != "nt" or s.startswith("\\\\?\\"):
+        return s
+    if s.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + s[2:]
+    return "\\\\?\\" + s
+
+
+def unlink_link(path: str) -> None:
+    """Remove a link ITSELF. A directory junction/symlink on Windows needs rmdir;
+    neither call touches the target."""
+    try:
+        os.unlink(path)
+    except OSError:
+        os.rmdir(path)
+
+
+def _force(fn, path: str) -> None:
+    try:
+        fn(path)
+    except PermissionError:
+        # Read-only bit on Windows; clear it and retry once.
+        os.chmod(path, stat.S_IWRITE)
+        fn(path)
+
+
+def walk_no_follow(root: str | os.PathLike):
+    """Yield (dirpath, dir_entries, file_entries, link_entries) top-down.
+
+    Like os.walk, except a link of ANY kind (symlink, junction, reparse point)
+    is reported in `link_entries` and never descended -- the one property every
+    destructive caller here depends on.
+    """
+    stack = [os.fspath(root)]
+    while stack:
+        d = stack.pop()
+        dirs: list[os.DirEntry] = []
+        files: list[os.DirEntry] = []
+        links: list[os.DirEntry] = []
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    if entry_is_link(e):
+                        links.append(e)
+                    else:
+                        try:
+                            isdir = e.is_dir(follow_symlinks=False)
+                        except OSError:
+                            isdir = False
+                        (dirs if isdir else files).append(e)
+        except OSError:
+            continue
+        yield d, dirs, files, links
+        stack.extend(e.path for e in reversed(dirs))
+
+
+def remove_tree(path: str | os.PathLike) -> tuple[int, list[str]]:
+    """Delete a file or tree without following any link. Returns (bytes, errors).
+
+    A link at the top or anywhere inside is unlinked; its target is untouched.
+    Errors are collected, not raised: the caller re-stats, so a stubborn file
+    surfaces as bytes that did not go away, never as a silent success.
+    """
+    top = long_path(path)
+    errors: list[str] = []
+    removed = 0
+    try:
+        st = os.lstat(top)
+    except FileNotFoundError:
+        return 0, []
+    except OSError as exc:
+        return 0, [f"{path}: {type(exc).__name__}"]
+    if _stat_is_link(st):
+        try:
+            unlink_link(top)
+        except OSError as exc:
+            errors.append(f"{path}: {type(exc).__name__}")
+        return 0, errors
+    if not stat.S_ISDIR(st.st_mode):
+        try:
+            _force(os.unlink, top)
+            removed += int(st.st_size)
+        except OSError as exc:
+            errors.append(f"{path}: {type(exc).__name__}")
+        return removed, errors
+    dirs_in_order: list[str] = []
+    for d, _dirs, files, links in walk_no_follow(top):
+        dirs_in_order.append(d)
+        for e in links:
+            try:
+                unlink_link(e.path)
+            except OSError as exc:
+                errors.append(f"{e.path}: {type(exc).__name__}")
+        for e in files:
+            try:
+                size = e.stat(follow_symlinks=False).st_size
+                _force(os.unlink, e.path)
+                removed += int(size)
+            except OSError as exc:
+                errors.append(f"{e.path}: {type(exc).__name__}")
+    for d in reversed(dirs_in_order):  # children before parents
+        try:
+            _force(os.rmdir, d)
+        except OSError as exc:
+            errors.append(f"{d}: {type(exc).__name__}")
+    return removed, errors
+
+
+def contains_link(path: str | os.PathLike) -> bool:
+    """Does the tree hold a link anywhere (the top included)?"""
+    if is_link(path):
+        return True
+    for _d, _dirs, _files, links in walk_no_follow(long_path(path)):
+        if links:
+            return True
+    return False
 
 
 def exclusive_bytes(snapshot: dict) -> dict[str, int]:

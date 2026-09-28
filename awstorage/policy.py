@@ -19,15 +19,15 @@ Dry-run is the default. `--yes` is a flag on the CLI, `dry_run=False` here.
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
-import stat
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from ._fs import fingerprint
+from ._fs import contains_link, fingerprint, is_link, remove_tree, walk_no_follow
 
 NEVER_AUTO = frozenset({"service-state", "dataset", "vm-disk", "backup", "unknown"})
 ACTIONS = ("delete", "compress", "backup-then-delete", "review", "prune-engine")
@@ -91,6 +91,10 @@ def default_policy() -> dict:
              "min_bytes": 5 * 2**30, "older_than_days": 90,
              "why": "renders are outputs; snapshot before reclaiming"},
         ],
+        # Retention rules for `sweep`. EMPTY on purpose: the shipped presets
+        # (awstorage.sweep.presets) run only when named -- nothing is swept unless a
+        # rule names it. A policy file adds entries here with the same shape.
+        "retention": [],
     }
 
 
@@ -173,10 +177,10 @@ def _current_fingerprint(path: Path) -> str:
     total = 0
     files = 0
     newest = 0.0
-    for dirpath, _dirs, filenames in os.walk(path):
-        for fn in filenames:
+    for _d, _dirs, file_entries, _links in walk_no_follow(path):
+        for e in file_entries:
             try:
-                st = os.stat(os.path.join(dirpath, fn), follow_symlinks=False)
+                st = e.stat(follow_symlinks=False)
             except OSError:
                 continue
             total += st.st_size
@@ -230,26 +234,16 @@ def _build_in_progress() -> bool:
 
 
 def _rmtree(path: Path) -> int:
-    """Remove a tree, returning bytes removed; clears read-only bits on Windows."""
-    removed = 0
+    """Remove a tree, returning bytes removed; clears read-only bits on Windows.
+
+    Never follows a link: a symlink or junction inside the tree is unlinked and
+    its target left alone (`_fs.remove_tree`). shutil.rmtree is NOT used -- before
+    3.12 its junction handling differs by version, and "which Python ran the
+    purge" must not decide whether a junction's target survives.
+    """
     _last_rm_error.clear()
-
-    def onerror(func, p, _exc):
-        try:
-            os.chmod(p, stat.S_IWRITE)
-            func(p)
-        except OSError as exc:
-            # Best effort on the retry: the caller re-stats, so a stubborn file
-            # surfaces as bytes that did not go away, never as a silent success.
-            _last_rm_error.append(f"{p}: {type(exc).__name__}")
-
-    for dirpath, _d, filenames in os.walk(path):
-        for fn in filenames:
-            try:
-                removed += os.stat(os.path.join(dirpath, fn), follow_symlinks=False).st_size
-            except OSError:
-                continue
-    shutil.rmtree(path, onerror=onerror)
+    removed, errors = remove_tree(path)
+    _last_rm_error.extend(errors)
     return removed
 
 
@@ -372,10 +366,10 @@ def _owning_root(path: Path, roots: list[Path]) -> Path:
 
 def _tree_bytes(path: Path) -> int:
     total = 0
-    for dirpath, _d, filenames in os.walk(path):
-        for fn in filenames:
+    for _d, _dirs, file_entries, _links in walk_no_follow(path):
+        for e in file_entries:
             try:
-                total += os.stat(os.path.join(dirpath, fn), follow_symlinks=False).st_size
+                total += e.stat(follow_symlinks=False).st_size
             except OSError:
                 continue
     return total
@@ -390,12 +384,31 @@ def _quarantine(target: Path, roots: list[Path], proposal_id: int | None) -> tup
     dest = qdir / target.name
     # Record where it came from so revert needs nothing but the quarantine dir.
     (qdir / "ORIGIN").write_text(str(target), encoding="utf-8")
-    try:
-        os.replace(str(target), str(dest))
-    except OSError:
-        # Cross-device (a mount point inside the root): fall back to a move.
-        shutil.move(str(target), str(dest))
+    move_no_follow(target, dest)
     return size, str(dest).replace("\\", "/")
+
+
+def move_no_follow(src: Path | str, dest: Path | str) -> None:
+    """Rename `src` to `dest`; a link moves as a link, never as its target's bytes.
+
+    A same-volume rename is atomic and moves a junction as a junction. The
+    cross-device fallback (shutil.move = copy, then delete) would COPY a junction's
+    target before 3.12 (it is not a symlink to copytree) -- so a tree holding any
+    link is refused on that path rather than dereferenced.
+    """
+    try:
+        os.replace(str(src), str(dest))
+        return
+    except OSError as exc:
+        # ONLY a cross-device rename falls back to copy+delete. A sharing violation
+        # (a file held open on Windows) falling back would copy the tree and then
+        # half-delete the original around the locked file -- the worst of both.
+        if exc.errno != errno.EXDEV and getattr(exc, "winerror", None) != 17:
+            raise
+        if contains_link(src):
+            raise ApplyRefused(f"{src}: cross-device move of a tree holding a symlink/"
+                               "junction refused (it would copy the link target)") from None
+    shutil.move(str(src), str(dest))
 
 
 def revert(quarantine_entry: Path | str) -> str:
@@ -411,11 +424,8 @@ def revert(quarantine_entry: Path | str) -> str:
     if origin.exists():
         raise ApplyRefused(f"origin {origin} exists again; will not overwrite it")
     origin.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.replace(str(payload[0]), str(origin))
-    except OSError:
-        shutil.move(str(payload[0]), str(origin))
-    shutil.rmtree(q, ignore_errors=True)
+    move_no_follow(payload[0], origin)
+    remove_tree(q)
     return str(origin).replace("\\", "/")
 
 
@@ -436,7 +446,8 @@ def list_quarantine(roots: list[Path | str]) -> list[dict]:
                 age_days = (time.time() - entry.stat().st_mtime) / 86400.0
             except OSError:
                 age_days = 0.0
-            payload = sum(_tree_bytes(c) if c.is_dir() else c.stat().st_size
+            payload = sum(_tree_bytes(c) if c.is_dir() and not is_link(c)
+                          else c.lstat().st_size
                           for c in entry.iterdir() if c.name != "ORIGIN")
             out.append({"entry": str(entry).replace("\\", "/"), "origin": origin,
                         "bytes": payload, "age_days": round(age_days, 1)})

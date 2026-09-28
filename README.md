@@ -45,6 +45,8 @@ Stdlib only. Works alone, offline, on the box whose disk is full.
    byte-for-byte, and only `quarantine --purge-older-than N --yes` reclaims the bytes.
    `apply` refuses anything outside the declared roots, anything that changed since the
    scan, and anything neither pre-approved nor approved. Every outcome is ledgered.
+6. **Sweep** -- named retention rules, unattended: live guard, harvest-first (verified,
+   secrets withheld), link-safe removal, a receipt on every exit path. See below.
 
 ## Python
 
@@ -61,6 +63,88 @@ props = awstorage.propose(snap, awstorage.default_policy(), snapshot_id=sid)
 awstorage.apply(props[0], roots=[Path("E:/")], dry_run=True)
 ```
 
+## Sweep agent scratch automatically
+
+`scan -> propose -> apply` wants a person between the steps. The thing that filled
+drive C: on 2026-09-27 (122 MB free, a WSL root fs corrupted mid-boot) did not: 173 GB
+of per-session agent scratchpads under `%LOCALAPPDATA%\Temp\claude\<project>\<session>\`
+that nothing reaped -- one dead session held 106 GB -- plus ~19k stale Temp entries.
+`sweep` is the unattended half:
+
+```bash
+awstorage sweep --rules agent-scratch,temp-toplevel                  # dry run: the full plan
+awstorage sweep --rules agent-scratch,temp-toplevel --yes \
+    --harvest-to E:\AitherOS-Data\harvest --emergency-free-gb 40 \
+    --receipt ~/.aither/awstorage/last_sweep.json
+```
+
+Schedule it with [awrise](https://github.com/Aitherium/awrise):
+
+```bash
+awrise add --name awstorage-sweep --every 3h --detach --timeout 3600 -- awstorage sweep --rules agent-scratch,temp-toplevel --yes --harvest-to E:\AitherOS-Data\harvest --emergency-free-gb 40 --receipt ~/.aither/awstorage/last_sweep.json
+awrise set --name awstorage-sweep receipt=~/.aither/awstorage/last_sweep.json
+```
+
+One pass: **expand rules -> measure -> guard -> harvest -> remove -> ledger -> receipt.**
+
+- **Rules are data, and opt-in by name.** Shipped presets: `agent-scratch`
+  (`%LOCALAPPDATA%\Temp\claude\*\*` on Windows, `$TMPDIR/claude/*/*` elsewhere; idle 12h)
+  and `temp-toplevel` (`%LOCALAPPDATA%\Temp\*` minus the claude dir; idle 3d). Nothing is
+  swept without a rule naming it. Your own rules go in a JSON `--policy` file:
+  ```json
+  {"retention": [{"name": "build-scratch", "paths": ["~/scratch/*"], "class": "build-temp",
+                  "max_idle": "2d", "action": "quarantine", "purge_after": "3d",
+                  "exclude": ["~/scratch/keep-*"], "live_guard": {"window": "2h"},
+                  "harvest": {"include": ["**/*.md"], "max_file_kb": 256},
+                  "snapshot": false}]}
+  ```
+  One glob match = one item. `class` may not be a never-auto class (`service-state`,
+  `dataset`, `vm-disk`, `backup`, `unknown`).
+- **Age is the newest file inside the item**, never the item's own mtime.
+- **Live guard.** An item that changed inside `live_guard.window` (default 2h), or whose
+  name is registered live, is skipped and reported `skipped-live`. An agent runtime
+  registers its session scratch through `AWSTORAGE_LIVE_IDS` (comma/space separated) or
+  a `--live-ids` file (one id per line, `#` comments); an id matches the item's basename.
+  An unreadable `--live-ids` file stops the sweep (exit 2) -- "nobody is live" is never
+  a guess.
+- **Harvest first.** Small text files matching the include globs (default `**/*.md`,
+  `**/*.json`, `**/*report*`, `**/*eval*/**`, `**/results/**`; 512 KB/file, 20 MB/item;
+  NUL in the first 8 KB = binary) are copied to
+  `<shelf>/<rule>/<YYYY-MM-DD>/<item>/` with a `manifest.json` (item, bytes, file count,
+  top-20 subdirs, every copy's sha256, every skip's reason). Every copy is re-read and
+  checked (size + sha256) before the item may go; any failure keeps the item and exits 1.
+  A file matching a credential pattern (`sk-`, `ghp_`, `AKIA`, `xoxb-`, private-key
+  blocks, `password=<value>`, ...) is **withheld**: listed by name, never copied, the
+  match never written. `--harvest-offdrive` refuses a shelf on the item's own drive.
+- **Links are never followed.** A symlink or Windows junction inside an item is unlinked;
+  its target is untouched (removal, quarantine, purge and scan all ask the same
+  `is_link()`, which sees junctions on every Python).
+- **Quarantine by default.** Items move to `<base>/.awstorage-quarantine/sweep-<rule>-*`
+  (`awstorage revert` works on them) and are purged after the rule's `purge_after`.
+  `action: delete` deletes outright -- only with `--yes`, like everything else.
+- **Emergency.** `--emergency-free-gb N`: when an item's drive has less than N GB free,
+  that rule's `max_idle` (and `purge_after`) halve for the pass; harvest still runs first.
+- **Bounded.** `--time-budget SECONDS` (default 3000, inside awrise's 3600 s timeout)
+  stops the pass cleanly and marks the receipt `truncated`; a fresh item's walk stops
+  at its first too-new file instead of measuring 100 GB it will not touch. The next
+  pass resumes, starting with the item the budget cut (`resume_first` in the receipt)
+  -- a killed sweep would have left no receipt at all.
+- **Receipt on every exit path**: `{exit_code, started, finished, items_seen,
+  items_removed, bytes_freed, bytes_quarantined, bytes_harvested, skipped_live, errors,
+  free_before, free_after, ...}`. `bytes_freed` counts only bytes actually gone (deleted
+  or purged); a quarantine is reported separately. Exit 0 clean, 1 an item failed (kept,
+  reported), 2 could not judge (bad rule, unreadable root; nothing removed). Every
+  decision is a ledger row in the catalog (`--catalog`, default
+  `~/.aither/awstorage/catalog.db`).
+
+```python
+import awstorage
+receipt = awstorage.sweep(["agent-scratch"], dry_run=False,
+                          harvest_to="E:/AitherOS-Data/harvest", emergency_free_gb=40,
+                          receipt="~/.aither/awstorage/last_sweep.json",
+                          live_ids=["<my-session-id>"])
+```
+
 ## The three rules
 
 - **Measure before you delete.** A `du` answers one question once.
@@ -69,14 +153,49 @@ awstorage.apply(props[0], roots=[Path("E:/")], dry_run=True)
 
 ## Composes with
 
-- **awrecover** -- `backup_hook=lambda p: awrecover.snapshot(p, store, label)` turns
+Every coupling is optional and imported lazily (`pip install awstorage[harvest]` for
+awseal + awdit + awshare); without the package the sweep says "unavailable" in its
+receipt rather than pretending.
+
+- **awdit** -- every sweep decision (harvested, withheld-secret, skipped-live,
+  quarantined, deleted, purged, failed) is appended to a hash-chained, truncation-evident
+  log (`--audit-log`, default `~/.aither/awstorage/audit.log`); the intent is recorded
+  BEFORE a removal. `awstorage audit verify` checks it. `--require-audit` refuses to
+  remove anything (exit 2) when awdit is absent or an append fails.
+- **awseal** -- each harvested item dir is sealed (`awseal.json`, Ed25519) after its
+  copies verify, with `--seal-key` or awseal's own default key. An explicit key that
+  cannot seal keeps the item. `awstorage harvest verify <shelf>` reports sealed /
+  tampered / unsealed.
+- **awshare** -- `awstorage harvest publish <shelf>/<rule>/<day> --to <dir>` (or
+  `sweep --publish-to <dir>`) bundles a day's harvest; fetch it back with
+  `awshare.fetch(<dir>/<name>.awshare.json, dest)`, which verifies the digest before a
+  byte lands.
+- **awm** -- `sweep --land-to-awm tenant:user:project` lands ONE memory per harvested item
+  (`storage.harvest.<item>`: what was kept and where) through `MemoryStore.remember`,
+  never SQL; an older-schema awm file is reported as a compat problem, never migrated.
+- **awrecover** -- a rule with `"snapshot": true` snapshots each item before removal
+  (`--snapshot-store`); without awrecover the item is KEPT and reported. For proposals,
+  `backup_hook=lambda p: awrecover.snapshot(p, store, label)` turns
   `backup-then-delete` into a restorable snapshot first.
+- **AitherStrata** (the platform's tiered storage service) -- `--harvest-to
+  strata:<hot|warm|cold>` (default tier cold) uploads each verified harvested file plus
+  `manifest.json` (and `awseal.json` when sealed) with `POST /strata/write`, then reads
+  every object back with `GET /strata/stat/<tier>/<path>` and compares size (and sha256
+  when the server reports it) BEFORE the item may be removed; any mismatch keeps the
+  item. stdlib urllib + ssl only. URL from `AITHERSTRATA_URL` (default
+  `https://127.0.0.1:8136`; the service is TLS-only), CA from `AITHER_CA_BUNDLE` or
+  `<repo>/AitherOS/Library/Data/tls/ca-chain.pem`, key from `AWSTORAGE_STRATA_KEY` (sent
+  as `X-Internal-Key`, env var only). No CA, no key, or unreachable = "strata target
+  unavailable": nothing removed, exit 2. There is no unverified-TLS mode.
+- **awdk** -- calls `awstorage.sweep(...)` (returns the receipt dict) and registers its
+  running sessions through `AWSTORAGE_LIVE_IDS`.
+- **awrise** -- schedules the sweep and reads its receipt (see above).
 - **awdk / awnode / awsh** -- run the scanner where the disk is, post snapshots to a
   shared catalog, render proposals in a shell or a desktop panel.
 - **awgraph** -- `awstorage graph` emits nodes and typed edges (`contains`,
   `duplicate_of`) any graph store can ingest.
 
-`awstorage --self-test` proves the refusals still refuse and the quarantine still reverts.
+`awstorage --self-test` (or `python -m awstorage --self-test`) proves the refusals still refuse, the quarantine still reverts, and each sweep guard is seen firing: harvest-before-delete, secret withheld, live guard, junction not followed, emergency halving, receipt on failure.
 
 Apache-2.0.
 

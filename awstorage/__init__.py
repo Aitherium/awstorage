@@ -37,6 +37,11 @@ declared roots, anything whose fingerprint changed since the scan, and any
 class the policy does not pre-approve unless a human approved that proposal.
 It writes a ledger row either way. A dry run is the default.
 
+**Sweeping is harvest-first.** `sweep()` runs named retention rules unattended:
+it skips live items, copies the small text that outlives a session to a shelf
+(verified, secrets withheld) BEFORE removing anything, never follows a link, and
+writes a receipt on every exit path.
+
 The package is stdlib-only and speaks to nothing. Fleet integration (a scanner
 per node, a catalog behind an API, a GUI, an autonomous steward, model-backed
 classification) lives in the platform that imports it -- awstorage works alone.
@@ -67,8 +72,9 @@ from .policy import (
     revert,
 )
 from .report import rank, summarize
+from .sweep import LIVE_IDS_ENV, SweepConfigError, presets, sweep
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -93,5 +99,9 @@ __all__ = [
     "revert",
     "rank",
     "summarize",
+    "sweep",
+    "presets",
+    "SweepConfigError",
+    "LIVE_IDS_ENV",
     "__version__",
 ]

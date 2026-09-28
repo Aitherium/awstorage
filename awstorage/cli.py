@@ -12,10 +12,15 @@
     awstorage push --catalog inv.db --node ID --gateway URL [--snapshot ID] [--bearer-file F]
     awstorage node-run --node ID --root ROOT [--root ROOT ...] [--gateway URL] [--once]
     awstorage hash <path...>
-    awstorage --self-test
+    awstorage sweep --rules agent-scratch,temp-toplevel [--policy F] [--yes]
+                    [--harvest-to D] [--emergency-free-gb N] [--receipt PATH] [--json]
+    awstorage audit verify [--audit-log PATH]
+    awstorage harvest verify <shelf> | harvest publish <day-dir> --to <target>
+    awstorage --self-test            (also: python -m awstorage --self-test)
 
-Exit 0 on success, 1 when a proposal is REFUSED (the refusal is the answer),
-2 when the command could not run at all (bad root, missing catalog row).
+Exit 0 on success, 1 when a proposal is REFUSED (the refusal is the answer) or a
+swept item failed (it is kept and reported), 2 when the command could not run or
+could not judge at all (bad root, bad rule, missing catalog row).
 Dry-run is the default everywhere destructive; `--yes` is the only way to act.
 """
 
@@ -50,6 +55,7 @@ from .policy import (
 )
 from .remote import GatewayClient, GatewayError, push_snapshot
 from .report import human, rank, render_table, summarize
+from .sweep import LIVE_IDS_ENV
 
 
 def _load_policy(path: str | None) -> dict:
@@ -320,6 +326,126 @@ def _cmd_hash(a) -> int:
     return rc
 
 
+_AITHER = Path.home() / ".aither"
+
+
+def _cmd_sweep(a) -> int:
+    from .integrations import default_audit_log
+    from .sweep import sweep
+
+    policy = None
+    if a.policy:
+        try:
+            policy = _load_policy(a.policy)
+        except (OSError, ValueError) as exc:
+            # Judged, not crashed: sweep() exits 2 on it WITH a receipt written.
+            policy = {"_error": f"cannot load policy {a.policy}: {exc}"}
+    names = [n for n in (a.rules or "").split(",") if n.strip()]
+    rec = sweep(
+        names, policy=policy, dry_run=not a.yes, harvest_to=a.harvest_to,
+        harvest_offdrive=a.harvest_offdrive, emergency_free_gb=a.emergency_free_gb,
+        receipt=a.receipt, catalog=None if a.no_catalog else a.catalog,
+        live_ids_file=a.live_ids,
+        audit_log=None if a.no_audit else (a.audit_log or default_audit_log()),
+        require_audit=a.require_audit, seal_key=a.seal_key, seal=not a.no_seal,
+        publish_to=a.publish_to,
+        land_to_awm=a.land_to_awm, awm_db=a.awm_db, snapshot_store=a.snapshot_store,
+        time_budget_s=a.time_budget or None,
+    )
+    if a.json:
+        print(json.dumps(rec, indent=1, sort_keys=True, default=str))
+        return int(rec["exit_code"])
+    for e in rec["emergency"]:
+        print(e["message"])
+    mode = "DRY RUN (plan)" if rec["dry_run"] else "SWEEP"
+    if rec.get("truncated"):
+        mode += " [TRUNCATED by --time-budget]"
+    print(f"{mode}: rules {', '.join(r['name'] for r in rec['rules']) or '-'}; "
+          f"{rec['items_seen']} seen, {rec['items_eligible']} eligible, "
+          f"{rec['kept_fresh']} fresh, {len(rec['skipped_live'])} live, "
+          f"{len(rec['skipped_busy'])} busy")
+    for it in rec["items"]:
+        hv = it.get("harvest") or {}
+        extra = ""
+        if hv:
+            extra = f"  harvest {hv.get('files', 0)} file(s)/{human(hv.get('bytes', 0))}"
+            if hv.get("withheld"):
+                extra += f", withheld {hv['withheld']}"
+        print(f"  {it['outcome']:<12} {human(it.get('bytes', 0)):>10}  "
+              f"{it.get('age_h', 0):>7.1f}h  {it['path']}{extra}  -- {it['reason']}")
+    for q in rec["purged"]:
+        print(f"  {'purge ' + q['outcome']:<12} {human(q['bytes']):>10}  {q['entry']}")
+    print(f"removed {rec['items_removed']} item(s): freed {human(rec['bytes_freed'])}, "
+          f"quarantined {human(rec['bytes_quarantined'])}, harvested "
+          f"{rec['files_harvested']} file(s) / {human(rec['bytes_harvested'])}"
+          + (f", withheld {rec['withheld_secret']} (secret pattern)"
+             if rec["withheld_secret"] else ""))
+    for k, v in rec["free_before"].items():
+        after = rec["free_after"].get(k)
+        print(f"  free {k}: {human(v)} -> {human(after) if after is not None else '?'}")
+    for n in rec["notes"]:
+        print(f"  note: {n}")
+    for w in rec["warnings"]:
+        print(f"  warning: {w}")
+    for e in rec["errors"]:
+        print(f"  FAILED: {e}", file=sys.stderr)
+    for e in rec["could_not_judge"]:
+        print(f"  COULD NOT JUDGE: {e}", file=sys.stderr)
+    if rec["dry_run"] and rec["exit_code"] == 0:
+        print("dry run. Re-run with --yes to act.")
+    if a.receipt:
+        print(f"receipt -> {a.receipt}")
+    return int(rec["exit_code"])
+
+
+def _cmd_audit(a) -> int:
+    from .integrations import audit_verify, default_audit_log
+
+    r = audit_verify(a.audit_log or default_audit_log())
+    if a.json:
+        print(json.dumps(r, indent=1))
+    elif not r["available"]:
+        print(f"could not judge: {r['reason']}")
+    else:
+        print(f"{'ok' if r['ok'] else 'BROKEN'}: {r['count']} record(s)")
+        for prob in r.get("problems", []):
+            print(f"  {prob}")
+    if not r["available"]:
+        return 2
+    return 0 if r["ok"] else 1
+
+
+def _cmd_harvest(a) -> int:
+    from .integrations import publish_day, verify_shelf
+
+    if a.harvest_cmd == "verify":
+        r = verify_shelf(Path(a.shelf), expect_key=a.expect_key)
+        if a.json:
+            print(json.dumps(r, indent=1))
+        elif not r["available"]:
+            print(f"could not judge: {r['reason']}")
+        else:
+            c = r["counts"]
+            print(f"{c['sealed']} sealed, {c['tampered']} tampered, {c['missing']} unsealed")
+            for it in r["items"]:
+                if it["status"] != "sealed":
+                    print(f"  {it['status'].upper():<9} {it['dir']}")
+        if not r["available"]:
+            return 2
+        return 0 if r["ok"] else 1
+    r = publish_day(Path(a.day_dir), Path(a.to), seal_key=a.seal_key)
+    if a.json:
+        print(json.dumps(r, indent=1))
+    elif r["ok"]:
+        print(f"published {r['name']} ({human(r['size'])}, sha256 {r['digest'][:16]}...)"
+              f" -> {r['manifest']}")
+    else:
+        print(f"{'could not publish' if r['available'] else 'unavailable'}: {r['reason']}")
+    if not r["available"]:
+        return 2
+    return 0 if r["ok"] else 1
+
+
 def self_test() -> int:
     """Prove the tool can still fail: refusals refuse, quarantine reverts, diff sees growth."""
     with tempfile.TemporaryDirectory() as td:
@@ -366,6 +492,11 @@ def self_test() -> int:
         if any(p.auto for p in data_props):
             print("self-test FAIL: service-state proposed as auto")
             return 1
+    print("apply/revert guards ok; sweep guards:")
+    from ._selftest import run as _sweep_self_test
+
+    if _sweep_self_test() != 0:
+        return 1
     print("self-test ok")
     return 0
 
@@ -487,6 +618,64 @@ def main(argv: list[str] | None = None) -> int:
     h = sub.add_parser("hash", help="sha256 a file or a directory tree, on demand")
     h.add_argument("path", nargs="+")
     h.set_defaults(fn=_cmd_hash)
+
+    sw = sub.add_parser("sweep", help="retention sweep: measure, guard, harvest, remove"
+                                       " (dry-run unless --yes)")
+    sw.add_argument("--rules", help="comma-separated rule names (presets: agent-scratch,"
+                                    " temp-toplevel); default: the --policy file's rules")
+    sw.add_argument("--policy", help="JSON policy file with a `retention` list")
+    grp = sw.add_mutually_exclusive_group()
+    grp.add_argument("--dry-run", action="store_true", help="print the plan (the default)")
+    grp.add_argument("--yes", action="store_true", help="act")
+    sw.add_argument("--harvest-to", default=str(_AITHER / "harvest"),
+                    help="harvest shelf dir (default ~/.aither/harvest), or strata:<hot|warm|"
+                         "cold> to ship verified harvests to AitherStrata (key from"
+                         " $AWSTORAGE_STRATA_KEY, URL from $AITHERSTRATA_URL)")
+    sw.add_argument("--harvest-offdrive", action="store_true",
+                    help="refuse a shelf on the same drive as the item")
+    sw.add_argument("--emergency-free-gb", type=float,
+                    help="below this free space on an item's drive, max_idle is halved")
+    sw.add_argument("--receipt", help="write the receipt JSON here (on every exit path)")
+    sw.add_argument("--time-budget", type=float, default=3000.0, metavar="SECONDS",
+                    help="stop cleanly after this long, receipt marked truncated (default"
+                         " 3000: inside a 3600 s scheduler timeout); 0 = no limit")
+    sw.add_argument("--json", action="store_true", help="print the receipt as JSON")
+    sw.add_argument("--catalog", default=str(_AITHER / "awstorage" / "catalog.db"),
+                    help="catalog whose ledger records every decision")
+    sw.add_argument("--no-catalog", action="store_true")
+    sw.add_argument("--live-ids", help=f"file of live ids, one per line (also ${LIVE_IDS_ENV})")
+    sw.add_argument("--audit-log", help="awdit log (default ~/.aither/awstorage/audit.log)")
+    sw.add_argument("--no-audit", action="store_true")
+    sw.add_argument("--require-audit", action="store_true",
+                    help="refuse to remove anything unless awdit records it (exit 2)")
+    sw.add_argument("--seal-key", help="awseal key for sealing each harvested item dir"
+                                       " (default: awseal's own key location, if any)")
+    sw.add_argument("--no-seal", action="store_true", help="do not seal harvested item dirs")
+    sw.add_argument("--publish-to", help="awshare-publish each touched harvest day here")
+    sw.add_argument("--land-to-awm", metavar="SCOPE",
+                    help="land one awm memory per harvested item at SCOPE")
+    sw.add_argument("--awm-db", help="awm db (default: awm's own)")
+    sw.add_argument("--snapshot-store", help="awrecover store for rules with snapshot: true")
+    sw.set_defaults(fn=_cmd_sweep)
+
+    au = sub.add_parser("audit", help="verify the sweep audit log (awdit)")
+    au.add_argument("audit_cmd", choices=["verify"])
+    au.add_argument("--audit-log")
+    au.add_argument("--json", action="store_true")
+    au.set_defaults(fn=_cmd_audit)
+
+    hv = sub.add_parser("harvest", help="verify seals on / publish a harvest shelf")
+    hsub = hv.add_subparsers(dest="harvest_cmd", required=True)
+    hvv = hsub.add_parser("verify", help="check every item seal under a shelf")
+    hvv.add_argument("shelf")
+    hvv.add_argument("--expect-key", help="publisher public key (hex) to trust")
+    hvv.add_argument("--json", action="store_true")
+    hvp = hsub.add_parser("publish", help="awshare-bundle one day's harvest")
+    hvp.add_argument("day_dir")
+    hvp.add_argument("--to", required=True)
+    hvp.add_argument("--seal-key")
+    hvp.add_argument("--json", action="store_true")
+    hv.set_defaults(fn=_cmd_harvest)
 
     a = ap.parse_args(argv)
     if a.self_test:
