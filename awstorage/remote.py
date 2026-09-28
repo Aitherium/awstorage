@@ -376,6 +376,116 @@ def report_apply(client: GatewayClient, node_id: str, rows: list[dict]) -> dict:
     return result if isinstance(result, dict) else {"raw": result}
 
 
+# ---------------------------------------------------------------------------
+# file index push (`awstorage files push`) -- the delta protocol
+# ---------------------------------------------------------------------------
+#
+# One body per part: {scan_id, root, since_seq, to_seq, part, parts, upserts,
+# deletes, truncated, volumes, scanned_at}. since_seq is what the fleet last
+# acknowledged for this root (0 == full resync). Genesis answers a seq gap with
+# HTTP 409 {resync}; the pusher then resends the root in full, once. A part whose
+# deletes pass 50k is accepted as a JOB (HTTP 202 + job id) and is never retried
+# -- the 30 s MCP timeout is not a failure signal for it.
+
+#: Genesis's per-part row cap for POST /files/{node} (awstorage.files.MAX_PART_ROWS).
+MAX_FILE_ROWS = 50_000
+
+
+class ResyncNeeded(GatewayError):
+    """Genesis holds a different seq for this root; resend it in full."""
+
+
+def _is_resync(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("resync"):
+        return True
+    d = result.get("detail")
+    return isinstance(d, dict) and bool(d.get("resync"))
+
+
+def _scan_id(node_id: str) -> str:
+    import re  # noqa: PLC0415
+    import secrets  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "-", node_id)[:32] or "node"
+    return f"{safe}.{int(time.time())}.{secrets.token_hex(4)}"
+
+
+def _push_root(client: GatewayClient, db: Any, node_id: str, root: dict,
+               volumes: list | None, max_bytes: int, max_rows: int) -> dict:
+    from . import files as awfiles  # noqa: PLC0415
+
+    since = int(root["pushed_seq"] or 0)
+    for _attempt in (1, 2):
+        scan_id = _scan_id(node_id)
+        sent = written = unchanged = rejected = pruned = parts = 0
+        to_seq, job = None, None
+        try:
+            for body in awfiles.push_parts(
+                    db, node=node_id, root=root["root"], since_seq=since, scan_id=scan_id,
+                    truncated=bool(root["truncated"]), volumes=volumes,
+                    scanned_at=root.get("scanned_at"), max_bytes=max_bytes,
+                    max_rows=max_rows):
+                to_seq = body["to_seq"]
+                result = client.call_tool("storage_ingest_files", {
+                    "node_id": node_id, "body_json": json.dumps(body, separators=(",", ":")),
+                    "part": body["part"], "parts": body["parts"]})
+                if _is_resync(result):
+                    raise ResyncNeeded(f"{root['root']}: fleet index is not at seq {since}")
+                if isinstance(result, dict) and result.get("job_id"):
+                    job = result["job_id"]  # a large prune runs server-side; never re-sent
+                elif isinstance(result, dict) and (result.get("error") or (
+                        "written" not in result and result.get("detail"))):
+                    raise GatewayError(
+                        f"files push part {body['part']}/{body['parts']} for {node_id}:"
+                        f"{root['root']} refused: {result.get('error') or result.get('detail')}")
+                elif isinstance(result, dict):
+                    written += int(result.get("written") or 0)
+                    unchanged += int(result.get("unchanged") or 0)
+                    rejected += int(result.get("rejected") or 0)
+                    pruned += int(result.get("pruned") or 0)
+                sent += len(body["upserts"]) + len(body["deletes"])
+                parts += 1
+        except ResyncNeeded:
+            if since == 0:
+                raise GatewayError(f"{node_id}:{root['root']}: Genesis refused a FULL resync")
+            awfiles.reset_pushed(db, node=node_id, root=root["root"])
+            since = 0
+            continue
+        upserts_sent = sent
+        if upserts_sent and job is None and written + unchanged == 0 and pruned == 0:
+            raise GatewayError(
+                f"files push for {node_id}:{root['root']} wrote 0 of {sent} rows across "
+                f"{parts} part(s) -- treated as a FAILED push")
+        if to_seq is not None:
+            awfiles.mark_pushed(db, node=node_id, root=root["root"], to_seq=to_seq)
+        return {"root": root["root"], "since_seq": since, "to_seq": to_seq, "parts": parts,
+                "sent": sent, "written": written, "unchanged": unchanged,
+                "rejected": rejected, "pruned": pruned, "job_id": job,
+                "resync": since == 0}
+    raise GatewayError(f"{node_id}:{root['root']}: resync loop")  # pragma: no cover
+
+
+def push_files(client: GatewayClient, db: Any, node_id: str, *,
+               volumes: list | None = None, roots: list[str] | None = None,
+               max_bytes: int = MAX_PART_BYTES - _CHUNK_SAFETY_MARGIN,
+               max_rows: int = MAX_FILE_ROWS) -> dict:
+    """Push every indexed root of `node_id` from a files.db connection: a delta since
+    what the fleet last acknowledged, or a full resync when it has nothing or answers
+    409. Raises GatewayError on a refused part or a push that wrote nothing."""
+    from . import files as awfiles  # noqa: PLC0415
+
+    todo = [r for r in awfiles.local_roots(db, node_id) if not roots or r["root"] in roots]
+    if not todo:
+        raise GatewayError(f"nothing indexed for node {node_id} -- run `awstorage files scan`")
+    out = [_push_root(client, db, node_id, r, volumes, max_bytes, max_rows) for r in todo]
+    return {"node_id": node_id, "roots": out,
+            "sent": sum(r["sent"] for r in out), "written": sum(r["written"] for r in out),
+            "parts": sum(r["parts"] for r in out)}
+
+
 def fetch_manage_order(client: GatewayClient, node_id: str, proposal_id: int) -> dict:
     """One card order with its approving decision record, read by Genesis from the
     decision plane: ``{"order": {...}, "card": {...}}``. The node re-verifies the

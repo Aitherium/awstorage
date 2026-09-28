@@ -61,6 +61,8 @@ from .classify import (
 )
 from .diff import diff_snapshots
 from .graph import to_graph
+from .guards import Guards, is_sensitive
+from .identity import list_volumes, whoami
 from .policy import (
     ApplyRefused,
     Proposal,
@@ -74,7 +76,7 @@ from .policy import (
 from .report import rank, summarize
 from .sweep import LIVE_IDS_ENV, SweepConfigError, presets, sweep
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -89,6 +91,10 @@ __all__ = [
     "classify_tree",
     "diff_snapshots",
     "to_graph",
+    "Guards",
+    "is_sensitive",
+    "list_volumes",
+    "whoami",
     "ApplyRefused",
     "Proposal",
     "apply",

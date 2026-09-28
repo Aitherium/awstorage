@@ -199,11 +199,16 @@ def default_manage_context(client: GatewayClient, node_id: str,
 
 def run_once(client: GatewayClient, *, node_id: str, roots: Iterable, depth: int = 3,
              budget: float = 300.0, collectors: Iterable[str] = (),
-             manage: Optional[ManageContext] = None) -> dict:
+             manage: Optional[ManageContext] = None, orders_only: bool = False) -> dict:
     """One full pass over an ALREADY-CONNECTED client. Returns a summary dict;
     raises GatewayError when the pass, taken as a whole, wrote nothing to the
     fleet -- the caller (`run_loop`) turns that into a non-zero exit, never a
-    quiet 'ok'."""
+    quiet 'ok'.
+
+    ``orders_only``: fetch, apply and report orders, but neither scan nor push
+    (the caller already did -- `awstorage-scan.sh` runs the scans first). The
+    roots still bound where an order may act. No orders is a success; a failed
+    fetch or report raises GatewayError, since then nothing was judged."""
     roots = list(roots)
     collectors = list(collectors)
     summary: dict = {
@@ -243,6 +248,12 @@ def run_once(client: GatewayClient, *, node_id: str, roots: Iterable, depth: int
             except GatewayError as exc:
                 summary["errors"].append(f"report_manage: {exc}")
 
+    if orders_only:
+        if summary["errors"]:
+            raise GatewayError(f"node-run --orders-only for {node_id}: "
+                               f"{'; '.join(summary['errors'])}")
+        return summary
+
     for root in roots:
         try:
             snap = scan(Path(root), max_depth=depth, time_budget_s=budget, node=node_id)
@@ -279,7 +290,7 @@ def run_once(client: GatewayClient, *, node_id: str, roots: Iterable, depth: int
 def run_loop(*, once: bool, node_id: str, roots: Iterable, gateway: str | None = None,
              bearer_file: Path | None = None, depth: int = 3, budget: float = 300.0,
              collectors: Iterable[str] = (), interval_s: float = 900.0,
-             out=sys.stdout, err=sys.stderr) -> int:
+             orders_only: bool = False, out=sys.stdout, err=sys.stderr) -> int:
     """The persistent loop `awstorage node-run` drives. Exit 0 a pass wrote
     something, 1 a pass ran and wrote nothing (or an order was refused with
     nothing else to show for it), 2 the gateway could not be reached at all.
@@ -296,12 +307,20 @@ def run_loop(*, once: bool, node_id: str, roots: Iterable, gateway: str | None =
         else:
             try:
                 summary = run_once(client, node_id=node_id, roots=roots, depth=depth,
-                                    budget=budget, collectors=collectors)
+                                    budget=budget, collectors=collectors,
+                                    orders_only=orders_only)
             except GatewayError as exc:
                 print(f"node-run FAILED: {exc}", file=err)
                 if once:
                     return 1
             else:
+                if orders_only:
+                    print(f"node-run ok (orders only): {len(summary['applied'])} order(s)"
+                          " applied", file=out)
+                    if once:
+                        return 0
+                    time.sleep(interval_s)
+                    continue
                 print(f"node-run ok: {summary['entries_written']} entries across "
                       f"{len(summary['pushes'])} push(es), "
                       f"{len(summary['applied'])} order(s) applied", file=out)

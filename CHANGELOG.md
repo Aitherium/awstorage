@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.0 -- 2026-09-28
+
+The per-file index and the manage plane in one CLI.
+
+### Added
+- **File index** (`awstorage files scan|find|dupes|tree|nodes|push`): one row per file in
+  `files.db` (the catalog's sibling), FTS name search, directory rollups, duplicates by
+  size -> partial hash -> sha256; incremental rescans with a per-row `seq` and
+  tombstones; `files push` sends a DELTA since the fleet's acknowledged seq (409 -> one
+  full resync). `awstorage.guards` is the one never/sensitive set; `awstorage whoami`
+  names the node every verb speaks for (`awstorage.identity`).
+- `awstorage manage revert|shares` (the node side of `awstorage.manage`).
+- `awstorage node-run --orders-only`: fetch, apply and report approved orders without
+  scanning or pushing (for a caller that already scanned -- `awstorage-scan.sh`).
+
+### Changed
+- `awstorage.manage` imports `awstorage.guards`; its embedded copy of the guard lists is
+  gone. The catalog accepts the manage statuses `executing`, `drifted`, `refused`,
+  `failed`.
+
 ## 0.2.1 -- 2026-09-28
 
 The first real unattended run (2026-09-28) exited 0, saw 8541 items, removed 1130 and

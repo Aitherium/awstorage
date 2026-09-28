@@ -25,12 +25,12 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import socket
 import subprocess
 from datetime import datetime, timezone
 from typing import Any
 
 from .._fs import SCHEMA_VERSION, fingerprint
+from ..identity import whoami as _whoami
 
 _SIZE_RE = re.compile(r"^\s*([\d.]+)\s*([KMGTP]?)i?B?\s*$", re.IGNORECASE)
 _UNITS = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
@@ -180,7 +180,7 @@ def collect(*, node: str | None = None, timeout: int = _DEFAULT_TIMEOUT,
     if podman is absent. `run` is injectable (tests pass a fake) -- never
     the real `subprocess.run` in a unit test.
     """
-    node = node or socket.gethostname()
+    node = node or _whoami()
     errors: list[str] = []
     if not podman_available():
         errors.append("podman: not on PATH")

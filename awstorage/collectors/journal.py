@@ -16,11 +16,11 @@ from __future__ import annotations
 
 import re
 import shutil
-import socket
 import subprocess
 from datetime import datetime, timezone
 
 from .._fs import SCHEMA_VERSION, fingerprint
+from ..identity import whoami as _whoami
 
 _SIZE_RE = re.compile(r"([\d.]+)\s*([KMGT]?)i?B?", re.IGNORECASE)
 _UNITS = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
@@ -48,7 +48,7 @@ def collect(*, node: str | None = None, timeout: int = _DEFAULT_TIMEOUT,
             run=subprocess.run) -> dict:
     """One snapshot rooted at `journal://engine`. `run` is injectable (tests
     pass a fake) -- never the real `subprocess.run` in a unit test."""
-    node = node or socket.gethostname()
+    node = node or _whoami()
     errors: list[str] = []
     size_bytes = 0
     if not journalctl_available():

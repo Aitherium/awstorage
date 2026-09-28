@@ -65,6 +65,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
+from .guards import Guards
 from .policy import CARD_ACTIONS, QUARANTINE_DIRNAME, ApplyRefused, _owning_root, _under_roots
 
 #: The catalog `cls` each card action is filed under.
@@ -201,54 +202,12 @@ def sha256_file(path: Path | str, *, chunk: int = 1 << 20) -> str:
 
 
 # ---------------------------------------------------------------------------------
-# Guards (A6). disk-core ships awstorage.guards; until it is on this branch a copy of
-# its lists refuses the same paths. The fallback is deliberately the same data.
+# Guards (A6): the one never set lives in awstorage.guards -- no copy of its lists here.
 # ---------------------------------------------------------------------------------
-
-try:  # pragma: no cover - exercised once disk-core merges
-    from .guards import Guards as _Guards  # type: ignore[import-not-found]
-except ImportError as _guards_exc:
-    import fnmatch
-    import sys as _sys
-
-    if getattr(_guards_exc, "name", "") != f"{__package__}.guards":
-        # guards.py EXISTS but failed inside: keep the real cause visible.
-        print(f"awstorage.manage: awstorage.guards failed to import ({_guards_exc!r}); "
-              "using the built-in guard lists", file=_sys.stderr)
-
-    _SENSITIVE_DIRS = frozenset({".ssh", ".gnupg", ".aither", ".aws", ".kube", ".docker"})
-    _SENSITIVE_GLOBS = (".env*", "id_rsa*", "id_ed25519*", "*.pem", "*.key", "*.pfx",
-                        "*.p12", "*.kdbx", "*credentials*")
-    _NEVER_CONTAINS = ("/library/data/", "postgres", "pg_wal", "/.git/objects", "secrets",
-                       "lockbox", ".vhdx")
-
-    class _Guards:  # type: ignore[no-redef]
-        def __init__(self) -> None:
-            roots = ["/usr", "/nix/store"]
-            for env, default in (("SystemRoot", "C:/Windows"),
-                                 ("ProgramFiles", "C:/Program Files"),
-                                 ("ProgramFiles(x86)", "C:/Program Files (x86)"),
-                                 ("ProgramData", "C:/ProgramData")):
-                roots.append(os.environ.get(env) or default)
-            self._roots = [r.replace("\\", "/").rstrip("/").lower() for r in roots]
-
-        def refusal(self, path: str) -> Optional[str]:
-            p = str(path).replace("\\", "/")
-            parts = [x.lower() for x in p.split("/") if x]
-            if parts and (any(x in _SENSITIVE_DIRS for x in parts)
-                          or any(fnmatch.fnmatchcase(parts[-1], g) for g in _SENSITIVE_GLOBS)):
-                return "sensitive path (credential or key material)"
-            pl = p.lower()
-            if (any(pl == r or pl.startswith(r + "/") for r in self._roots)
-                    or any(m in pl + "/" for m in _NEVER_CONTAINS)
-                    or "node_modules" in parts[:-1]):
-                return "never-set path (live state, source, OS tree or node_modules)"
-            return None
-
 
 def guard_refusal(path: str) -> Optional[str]:
     """Why a manage/share action must refuse `path` (A6), or None."""
-    return _Guards().refusal(str(path))
+    return Guards().refusal(str(path))
 
 
 def git_refusal(path: Path | str) -> Optional[str]:

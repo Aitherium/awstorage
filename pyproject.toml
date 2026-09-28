@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "awstorage"
-version = "0.2.1"
+version = "0.3.0"
 description = "Scan a drive, get a ranked inventory of what fills it, classified re-fetchable or not, diffed against last time -- before you delete anything."
 readme = "README.md"
 requires-python = ">=3.10"

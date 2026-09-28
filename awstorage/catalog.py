@@ -78,7 +78,8 @@ CREATE TABLE IF NOT EXISTS ledger (
 );
 """
 
-_STATUSES = {"proposed", "approved", "rejected", "applied", "expired", "snoozed"}
+_STATUSES = {"proposed", "approved", "rejected", "applied", "expired", "snoozed",
+             "executing", "drifted", "refused", "failed"}
 
 
 def _now() -> str:

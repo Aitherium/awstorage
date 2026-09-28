@@ -364,3 +364,47 @@ def test_legacy_dotted_order_is_dispatched_as_card_only(tmp_path: Path):
     local.close()
     [row] = apply_orders([{**order_row, "action": "dedup.quarantine_copies"}], roots=[root])
     assert row["outcome"] == "refused" and row["action"] == "quarantine-copy"
+
+
+# ------------------------------------------------------------------ --orders-only
+
+
+class _FailingFetchClient(_FakeClient):
+    def call_tool(self, name: str, args: dict):
+        if name == "storage_requests":
+            self.calls.append((name, args))
+            return {"error": "simulated: Genesis down"}
+        return super().call_tool(name, args)
+
+
+def test_orders_only_applies_and_reports_but_never_scans(tree: Path):
+    """`node-run --orders-only` (awstorage-scan.sh, after its own scans): orders are
+    applied and reported; no root is walked and nothing is pushed a second time."""
+    client = _FakeClient(orders=[_order(tree / "keep", pid=4)])
+    summary = run_once(client, node_id="test-node", roots=[tree], orders_only=True)
+    assert [r["proposal_id"] for r in summary["applied"]] == [4]
+    names = [c[0] for c in client.calls]
+    assert "storage_report_apply" in names and "storage_ingest_scan" not in names
+
+
+def test_orders_only_with_no_orders_is_success_not_zero_entries(tree: Path, monkeypatch):
+    inner = _FakeClient(orders=[], ingest_entries=0)
+    monkeypatch.setattr("awstorage.node_run.GatewayClient",
+                        lambda *a, **k: _FakeConnectingClient(inner=inner))
+    assert run_loop(once=True, node_id="test-node", roots=[tree], orders_only=True) == 0
+    assert [c[0] for c in inner.calls] == ["storage_requests"]
+
+
+def test_orders_only_failed_fetch_exits_1(tree: Path, monkeypatch):
+    inner = _FailingFetchClient(orders=[])
+    monkeypatch.setattr("awstorage.node_run.GatewayClient",
+                        lambda *a, **k: _FakeConnectingClient(inner=inner))
+    assert run_loop(once=True, node_id="test-node", roots=[tree], orders_only=True) == 1
+
+
+def test_cli_node_run_has_orders_only(capsys):
+    from awstorage.cli import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(["node-run", "--help"])
+    assert exc.value.code == 0 and "--orders-only" in capsys.readouterr().out

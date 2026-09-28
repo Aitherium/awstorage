@@ -45,8 +45,32 @@ Stdlib only. Works alone, offline, on the box whose disk is full.
    byte-for-byte, and only `quarantine --purge-older-than N --yes` reclaims the bytes.
    `apply` refuses anything outside the declared roots, anything that changed since the
    scan, and anything neither pre-approved nor approved. Every outcome is ledgered.
-6. **Sweep** -- named retention rules, unattended: live guard, harvest-first (verified,
+7. **Sweep** -- named retention rules, unattended: live guard, harvest-first (verified,
    secrets withheld), link-safe removal, a receipt on every exit path. See below.
+6. **Index files** (`awstorage files ...`): one row per file in `files.db` (the
+   catalog's sibling), searchable by file name (SQLite FTS5, trigram), rolled up by
+   directory, with duplicates found by size bucket, then a head+tail partial hash,
+   then a full sha256 -- hard links collapse, and `actionable_bytes` counts only
+   copies a manage action could really reclaim. Rescans are incremental: only files
+   whose size, mtime or hash changed are written (each takes a new `seq`); files a
+   COMPLETED walk no longer sees become tombstones; a truncated walk deletes nothing.
+   Credential-shaped files (`.ssh`, `.env*`, `*.pem`, ...) are indexed but flagged and
+   redacted for any non-platform reader (`awstorage.guards`).
+
+```bash
+awstorage whoami                                  # AWSTORAGE_NODE > ~/.aither/node-id > hostname
+awstorage files scan E:/ D:/Media --hash auto     # index + hash only possible dupes
+awstorage files scan --all-volumes                # every fixed volume minus the never set
+awstorage files find quarterly report --ext pdf   # every word, substring of the name
+awstorage files dupes --min-bytes 1048576         # most waste first
+awstorage files tree E:/ --depth 2                # sizes by path, from the rollup
+awstorage files nodes                             # what is indexed, and how stale
+awstorage files push                              # DELTA since the fleet's last seq
+awstorage manage shares                           # python -m awstorage.manage
+```
+
+`find|dupes|tree` read the FLEET index when a session bearer exists (`--remote`;
+`--local` reads this node's `files.db`).
 
 ## Python
 

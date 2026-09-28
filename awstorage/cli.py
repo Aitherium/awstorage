@@ -11,7 +11,17 @@
     awstorage graph --catalog inv.db --snapshot ID [--min-bytes N]
     awstorage push --catalog inv.db --node ID --gateway URL [--snapshot ID] [--bearer-file F]
     awstorage node-run --node ID --root ROOT [--root ROOT ...] [--gateway URL] [--once]
+                       [--orders-only]
     awstorage hash <path...>
+    awstorage whoami
+    awstorage files scan <root>... | --all-volumes [--hash auto|none|full] [--node ID]
+    awstorage files find <q> [--ext pdf] [--min-bytes N] [--newer DAYS] [--node ID]
+                             [--local|--remote] [--json]
+    awstorage files dupes [--min-bytes N] [--node ID] [--local|--remote] [--json]
+    awstorage files tree [<path>] [--depth 2] [--node ID] [--local|--remote] [--json]
+    awstorage files nodes [--json]
+    awstorage files push [--node ID] [--gateway URL] [--bearer-file F]
+    awstorage manage revert|shares ...           (python -m awstorage.manage)
     awstorage sweep --rules agent-scratch,temp-toplevel [--policy F] [--yes]
                     [--harvest-to D] [--emergency-free-gb N] [--measure-cap-s S]
                     [--receipt PATH] [--json]
@@ -31,7 +41,6 @@ import argparse
 import hashlib
 import json
 import os
-import socket
 import sys
 import tempfile
 import time
@@ -39,7 +48,10 @@ from pathlib import Path
 
 from . import __version__
 from ._fs import ScanError, scan
+from . import files as _files
 from .catalog import Catalog
+from .guards import Guards, load_topology
+from .identity import list_volumes, whoami, whoami_source
 from .classify import classify_snapshot
 from .diff import diff_snapshots
 from .graph import to_graph
@@ -54,7 +66,13 @@ from .policy import (
     purge_quarantine,
     revert,
 )
-from .remote import GatewayClient, GatewayError, push_snapshot
+from .remote import (
+    DEFAULT_BEARER_FILE,
+    GatewayClient,
+    GatewayError,
+    push_files,
+    push_snapshot,
+)
 from .report import human, rank, render_table, summarize
 from .sweep import LIVE_IDS_ENV
 
@@ -139,7 +157,7 @@ def _cmd_inventory(a) -> int:
 
 def _cmd_diff(a) -> int:
     cat = Catalog(a.catalog)
-    node = a.node or socket.gethostname()
+    node = a.node or whoami()
     newer, older = cat.latest_pair(node, a.root.replace("\\", "/"))
     if a.against is not None:
         older = cat.get_snapshot(a.against)
@@ -271,7 +289,7 @@ def _cmd_push(a) -> int:
     if not snap:
         print("no such snapshot", file=sys.stderr)
         return 2
-    node_id = a.node or snap.get("node") or socket.gethostname()
+    node_id = a.node or snap.get("node") or whoami()
     try:
         client = GatewayClient(base_url=a.gateway,
                                bearer_file=Path(a.bearer_file) if a.bearer_file else None)
@@ -291,6 +309,7 @@ def _cmd_node_run(a) -> int:
         once=a.once, node_id=a.node, roots=a.root, gateway=a.gateway,
         bearer_file=Path(a.bearer_file) if a.bearer_file else None,
         depth=a.depth, budget=a.budget, collectors=collectors, interval_s=a.interval,
+        orders_only=a.orders_only,
     )
 
 
@@ -326,6 +345,380 @@ def _cmd_hash(a) -> int:
         print(f"{h.hexdigest()}  {raw}")
     return rc
 
+
+# -- files (the file index) ------------------------------------------------------
+
+_REMOTE_TOOLS = {"search": "storage_files_search", "dupes": "storage_files_dupes",
+                 "tree": "storage_files_tree"}
+
+
+def _files_db(a):
+    return _files.open_index(getattr(a, "index", None)
+                             or _files.default_index_path(getattr(a, "catalog", None)))
+
+
+def _progress(quiet: bool):
+    if quiet:
+        return None
+
+    def tick(ev: dict) -> None:
+        if ev.get("phase") == "walk":
+            print(f"[files] walking {ev['root']}: {ev['files']} files, {human(ev['bytes'])}",
+                  file=sys.stderr, flush=True)
+        else:
+            print(f"[files] hashing: {ev['hashed']} files, {human(ev['bytes_read'])} read",
+                  file=sys.stderr, flush=True)
+    return tick
+
+
+def _all_volume_roots(g) -> list[str]:
+    roots = []
+    for v in list_volumes():
+        if v.get("kind") not in ("fixed", "removable"):
+            continue
+        m = _files.norm_path(v["mount"])
+        if g.is_never_dir(m):
+            continue
+        roots.append(m)
+    return roots
+
+
+def _cmd_whoami(a) -> int:
+    node, src = whoami(), whoami_source()
+    if a.json:
+        print(json.dumps({"node": node, "source": src}))
+    else:
+        print(f"{node}  ({src})")
+    return 0
+
+
+def _cmd_files_scan(a) -> int:
+    g = Guards(topology=load_topology(os.environ.get("AWSTORAGE_TOPOLOGY")))
+    roots = list(a.root or [])
+    if a.all_volumes:
+        roots += _all_volume_roots(g)
+    if not roots:
+        print("cannot scan: name a root or pass --all-volumes", file=sys.stderr)
+        return 2
+    for r in roots:
+        if not Path(r).is_dir():
+            print(f"cannot scan: root is not a directory: {r}", file=sys.stderr)
+            return 2
+    node = a.node or whoami()
+    db = _files_db(a)
+    try:
+        st = _files.scan_files(db, roots, node=node, hash_mode=a.hash, time_budget_s=a.budget,
+                               min_hash_bytes=a.min_hash_bytes,
+                               hash_budget_bytes=a.hash_budget_bytes,
+                               exclude_dirs=(set(_files.DEFAULT_EXCLUDE_DIRS)
+                                             | {e.lower() for e in a.exclude or []}),
+                               guards=g, skip_never_dirs=a.all_volumes,
+                               progress=_progress(a.quiet or a.json))
+    finally:
+        db.close()
+    if a.json:
+        print(json.dumps(st, indent=1))
+        return 0
+    print(f"{node}: {st['files_seen']} files in {len(st['roots'])} root(s) -- "
+          f"{st['new']} new, {st['changed']} changed, {st['unchanged']} unchanged, "
+          f"{st['removed']} removed, {st['errors']} errors, {st['elapsed_s']}s"
+          + ("  [TRUNCATED -- nothing pruned]" if st["truncated"] else ""))
+    print(f"  hashed: {st['partial_hashed']} partial, {st['full_hashed']} full, "
+          f"{human(st['bytes_read'])} read"
+          + (f"  [hash budget spent; {human(st['bytes_remaining'])} still unhashed]"
+             if st["hash_truncated"] else ""))
+    return 0
+
+
+def _remote_wanted(a) -> bool:
+    if getattr(a, "local", False):
+        return False
+    if getattr(a, "remote", False):
+        return True
+    bearer = Path(a.bearer_file) if getattr(a, "bearer_file", None) else DEFAULT_BEARER_FILE
+    return bearer.is_file()
+
+
+def _remote_call(a, what: str, params: dict) -> dict:
+    """Genesis HTTP with the session bearer when AWSTORAGE_API names it (a tenant
+    node), else the platform MCP gateway's storage_files_* tools."""
+    params = {k: v for k, v in params.items() if v not in (None, "", 0)}
+    api = os.environ.get("AWSTORAGE_API", "").rstrip("/")
+    bearer = Path(a.bearer_file) if getattr(a, "bearer_file", None) else DEFAULT_BEARER_FILE
+    if api:
+        import urllib.parse  # noqa: PLC0415
+        import urllib.request  # noqa: PLC0415
+
+        from .remote import _ssl_context  # noqa: PLC0415
+
+        url = f"{api}/files/{what}?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={
+            "Authorization": "Bearer " + bearer.read_text(encoding="utf-8").strip()})
+        with urllib.request.urlopen(req, timeout=60, context=_ssl_context(url)) as resp:  # noqa: S310
+            return json.loads(resp.read())
+    client = GatewayClient(base_url=getattr(a, "gateway", None), bearer_file=bearer)
+    client.connect()
+    res = client.call_tool(_REMOTE_TOOLS[what], params)
+    if isinstance(res, dict) and (res.get("error") or res.get("status") in (401, 403)):
+        raise GatewayError(str(res.get("error") or res))
+    return res if isinstance(res, dict) else {"raw": res}
+
+
+def _read(a, what: str, local_fn, remote_params: dict) -> dict | None:
+    if _remote_wanted(a):
+        try:
+            return _remote_call(a, what, remote_params)
+        except (GatewayError, OSError, ValueError) as exc:
+            print(f"remote {what} failed: {exc} (use --local to read this node's index)",
+                  file=sys.stderr)
+            return None
+    db = _files_db(a)
+    try:
+        out = local_fn(db)
+        out.update(_files.index_state(db, tenant=_files.PLATFORM_TENANT,
+                                      nodes=[a.node] if a.node else None))
+        return out
+    finally:
+        db.close()
+
+
+def _empty_hint(res: dict) -> str:
+    if not res.get("indexed_roots"):
+        return "not indexed yet -- run: awstorage files scan <root>  (or --all-volumes)"
+    if res.get("stale"):
+        return "no match (the index is STALE: older than 48 h -- rescan)"
+    return "no match"
+
+
+def _cmd_files_find(a) -> int:
+    try:
+        res = _read(a, "search", lambda db: _files.search(
+            db, a.q, nodes=a.node, ext=a.ext, min_bytes=a.min_bytes, newer_days=a.newer,
+            limit=a.limit, cursor=a.cursor),
+            {"q": a.q, "node": a.node, "ext": a.ext, "min_bytes": a.min_bytes,
+             "newer_days": a.newer, "limit": a.limit, "cursor": a.cursor})
+    except ValueError as exc:
+        print(f"cannot search: {exc}", file=sys.stderr)
+        return 2
+    if res is None:
+        return 2
+    if a.json:
+        print(json.dumps(res, indent=1))
+        return 0
+    for it in res.get("items", []):
+        print(f"{human(it['bytes']):>10}  {it['node']:<14} {it['path']}")
+    if res.get("next_cursor"):
+        print(f"-- more: --cursor {res['next_cursor']}"
+              + ("  (scan cap reached: partial)" if res.get("partial") else ""))
+    elif not res.get("items"):
+        print(_empty_hint(res))
+    return 0
+
+
+def _cmd_files_dupes(a) -> int:
+    try:
+        res = _read(a, "dupes", lambda db: _files.dupes(
+            db, nodes=a.node, min_bytes=a.min_bytes, limit=a.limit, cursor=a.cursor),
+            {"node": a.node, "min_bytes": a.min_bytes, "limit": a.limit, "cursor": a.cursor})
+    except ValueError as exc:
+        print(f"cannot list dupes: {exc}", file=sys.stderr)
+        return 2
+    if res is None:
+        return 2
+    if a.json:
+        print(json.dumps(res, indent=1))
+        return 0
+    groups = res.get("groups", [])
+    print(f"{len(groups)} group(s) shown; {human(res.get('total_wasted_bytes', 0))} wasted in"
+          " all duplicate groups" + ("" if a.node else " (confirmed hashes only)"))
+    for g in groups:
+        print(f"  {human(g['wasted_bytes']):>10} wasted ({human(g['actionable_bytes'])}"
+              f" actionable)  {g['count']} x {human(g['bytes'])}  sha256 {g['sha256'][:12]}")
+        for p in g["paths"]:
+            print(f"      {p['node']}:{p['path']}")
+        if g.get("paths_truncated"):
+            print("      ...")
+    if res.get("next_cursor"):
+        print(f"-- more: --cursor {res['next_cursor']}")
+    elif not groups:
+        print(_empty_hint(res))
+    return 0
+
+
+def _show_tree(children: list, indent: int) -> None:
+    for c in children:
+        mark = "/" if c["kind"] in ("dir", "root") else ""
+        print(f"{human(c['bytes']):>10}  {c['files']:>8}  {'  ' * indent}{c['name']}{mark}")
+        _show_tree(c.get("children") or [], indent + 1)
+
+
+def _cmd_files_tree(a) -> int:
+    node = a.node or whoami()
+    try:
+        res = _read(a, "tree", lambda db: _files.tree(
+            db, node, a.path, depth=a.depth, limit=a.limit, cursor=a.cursor),
+            {"node": node, "path": a.path, "depth": a.depth, "limit": a.limit,
+             "cursor": a.cursor})
+    except ValueError as exc:
+        print(f"cannot read tree: {exc}", file=sys.stderr)
+        return 2
+    if res is None:
+        return 2
+    if a.json:
+        print(json.dumps(res, indent=1))
+        return 0
+    print(f"{node}:{res.get('path') or '(roots)'}")
+    _show_tree(res.get("children", []), 0)
+    if res.get("next_cursor"):
+        print(f"-- more: --cursor {res['next_cursor']}")
+    elif not res.get("children"):
+        print("  " + _empty_hint(res))
+    return 0
+
+
+def _cmd_files_nodes(a) -> int:
+    db = _files_db(a)
+    try:
+        st = _files.nodes_status(db, tenant=_files.PLATFORM_TENANT)
+    finally:
+        db.close()
+    if a.json:
+        print(json.dumps({"nodes": st}, indent=1))
+        return 0
+    for n in st:
+        print(f"{n['node']}{'  [STALE]' if n['stale'] else ''}  last push: "
+              f"{n['last_push_at'] or 'never'}")
+        for r in n["roots"]:
+            print(f"  {human(r['bytes']):>10} {r['files']:>9} files  {r['root']}  "
+                  f"(scanned {r['scanned_at']}, {r['hashed_pct'] or 0}% hashed"
+                  + (", TRUNCATED" if r["truncated"] else "") + ")")
+    if not st:
+        print("not indexed yet -- run: awstorage files scan <root>  (or --all-volumes)")
+    return 0
+
+
+def _cmd_files_push(a) -> int:
+    node = a.node or whoami()
+    db = _files_db(a)
+    try:
+        client = GatewayClient(base_url=a.gateway,
+                               bearer_file=Path(a.bearer_file) if a.bearer_file else None)
+        client.connect()
+        res = push_files(client, db, node, volumes=list_volumes(), roots=a.root or None)
+    except GatewayError as exc:
+        print(f"REFUSED: {exc}")
+        return 1
+    finally:
+        db.close()
+    if a.json:
+        print(json.dumps(res, indent=1))
+        return 0
+    for r in res["roots"]:
+        kind = "full resync" if r["resync"] else f"delta since seq {r['since_seq']}"
+        print(f"pushed {node}:{r['root']} ({kind}): {r['written']} written, "
+              f"{r['unchanged']} unchanged, {r['rejected']} rejected, {r['pruned']} pruned "
+              f"in {r['parts']} part(s)" + (f"  [job {r['job_id']}]" if r["job_id"] else ""))
+    return 0
+
+
+def _cmd_files_help(a) -> int:
+    a.files_parser.print_help()
+    return 2
+
+
+def _cmd_manage(a) -> int:
+    return _run_manage(list(a.rest or []))
+
+
+def _run_manage(rest: list[str]) -> int:
+    """`awstorage manage ...` -> `python -m awstorage.manage` (revert|shares), with
+    the catalog defaulted the way every other verb defaults it. Dispatched before
+    argparse (a REMAINDER after a subparser drops a leading `--flag`)."""
+    try:
+        from .manage import main as manage_main  # noqa: PLC0415
+    except ImportError:
+        print("awstorage manage: this awstorage has no manage plane (awstorage.manage);"
+              " upgrade the package", file=sys.stderr)
+        return 2
+    if rest[:1] == ["--"]:
+        rest = rest[1:]
+    if "--db" not in rest:
+        rest = ["--db", str(_files.default_catalog_path())] + rest
+    return int(manage_main(rest) or 0)
+
+
+def _add_read_flags(p) -> None:
+    p.add_argument("--local", action="store_true", help="read this node's own index")
+    p.add_argument("--remote", action="store_true",
+                   help="read the fleet index (default when a session bearer exists)")
+    p.add_argument("--gateway")
+    p.add_argument("--bearer-file")
+
+
+def _add_files_parser(sub) -> None:
+    f = sub.add_parser("files", help="the file index: scan, find, dupes, tree, nodes, push")
+    f.set_defaults(fn=_cmd_files_help, files_parser=f)
+    fsub = f.add_subparsers(dest="files_cmd")
+
+    def common(p, node_help: str = "node id (default: awstorage whoami)") -> None:
+        p.add_argument("--catalog", help="catalog db; files.db is its sibling (default:"
+                                         " $AWSTORAGE_CATALOG or ~/.aither/awstorage/)")
+        p.add_argument("--index", help="files.db path (default: next to the catalog)")
+        p.add_argument("--node", help=node_help)
+        p.add_argument("--json", action="store_true")
+
+    s = fsub.add_parser("scan", help="index every file under the roots (incremental)")
+    s.add_argument("root", nargs="*")
+    s.add_argument("--all-volumes", action="store_true",
+                   help="every fixed volume, minus the never/constitution roots")
+    s.add_argument("--hash", choices=_files.HASH_MODES, default="auto",
+                   help="auto: only files that could be duplicates (default)")
+    s.add_argument("--budget", type=float, default=3600.0, help="seconds for walk + hash")
+    s.add_argument("--hash-budget-bytes", type=int, default=_files.DEFAULT_HASH_BUDGET_BYTES)
+    s.add_argument("--min-hash-bytes", type=int, default=_files.DEFAULT_MIN_HASH_BYTES)
+    s.add_argument("--exclude", action="append", help="extra directory name to skip")
+    s.add_argument("--quiet", action="store_true", help="no progress on stderr")
+    common(s)
+    s.set_defaults(fn=_cmd_files_scan)
+
+    fi = fsub.add_parser("find", help="search file names (every word, substring)")
+    fi.add_argument("q", nargs="?", default="")
+    fi.add_argument("--ext")
+    fi.add_argument("--min-bytes", type=int)
+    fi.add_argument("--newer", type=float, metavar="DAYS")
+    fi.add_argument("--limit", type=int, default=50)
+    fi.add_argument("--cursor")
+    common(fi, "only this node (default: every node in scope)")
+    _add_read_flags(fi)
+    fi.set_defaults(fn=_cmd_files_find)
+
+    d = fsub.add_parser("dupes", help="groups of byte-identical files, biggest waste first")
+    d.add_argument("--min-bytes", type=int, default=_files.DEFAULT_MIN_DUPE_BYTES)
+    d.add_argument("--limit", type=int, default=50)
+    d.add_argument("--cursor")
+    common(d, "only this node (default: every node in scope)")
+    _add_read_flags(d)
+    d.set_defaults(fn=_cmd_files_dupes)
+
+    t = fsub.add_parser("tree", help="sizes under a path, from the index")
+    t.add_argument("path", nargs="?", default="")
+    t.add_argument("--depth", type=int, default=1)
+    t.add_argument("--limit", type=int, default=200)
+    t.add_argument("--cursor")
+    common(t)
+    _add_read_flags(t)
+    t.set_defaults(fn=_cmd_files_tree)
+
+    n = fsub.add_parser("nodes", help="what this index holds: roots, freshness, volumes")
+    common(n)
+    n.set_defaults(fn=_cmd_files_nodes)
+
+    p = fsub.add_parser("push", help="push this node's index to Genesis (delta, chunked)")
+    p.add_argument("--gateway")
+    p.add_argument("--bearer-file")
+    p.add_argument("--root", action="append", help="only this indexed root (repeatable)")
+    common(p)
+    p.set_defaults(fn=_cmd_files_push)
 
 _AITHER = Path.home() / ".aither"
 
@@ -502,6 +895,21 @@ def self_test() -> int:
         if any(p.auto for p in data_props):
             print("self-test FAIL: service-state proposed as auto")
             return 1
+        # File index: a duplicate is found, and a rescan re-reads nothing unchanged.
+        (root / "data" / "big-copy").write_bytes(b"2" * 65536)
+        fdb = _files.open_index(Path(td) / "files.db")
+        try:
+            _files.scan_files(fdb, [root], node="selftest")
+            groups = _files.dupes(fdb, min_bytes=1)["groups"]
+            again = _files.scan_files(fdb, [root], node="selftest")
+        finally:
+            fdb.close()
+        if not any(g["count"] == 2 and g["bytes"] == 65536 for g in groups):
+            print("self-test FAIL: file index missed a byte-identical pair")
+            return 1
+        if again["bytes_read"] or again["changed"] or again["new"]:
+            print("self-test FAIL: file index re-read unchanged files on rescan")
+            return 1
     print("apply/revert guards ok; sweep guards:")
     from ._selftest import run as _sweep_self_test
 
@@ -526,6 +934,9 @@ def main(argv: list[str] | None = None) -> int:
         _sv = locals().get("argv")
         if _aw_state.cli_banner(_sv if _sv is not None else __import__("sys").argv[1:]):
             return 0
+    _argv = list(argv) if argv is not None else sys.argv[1:]
+    if _argv[:1] == ["manage"] and _argv[1:2] not in (["-h"], ["--help"]):
+        return _run_manage(_argv[1:])
     ap = argparse.ArgumentParser(prog="awstorage", description=__doc__.split("\n\n")[0])
     ap.add_argument("--version", action="version", version=f"awstorage {__version__}")
     ap.add_argument("--self-test", action="store_true", help="prove the tool can still fail")
@@ -623,11 +1034,25 @@ def main(argv: list[str] | None = None) -> int:
                                                                     " when not --once")
     nr.add_argument("--once", action="store_true", help="run one pass and exit"
                                                           " (default: loop forever)")
+    nr.add_argument("--orders-only", action="store_true",
+                    help="fetch, apply and report approved orders; no scan, no push (the"
+                         " caller already scanned the roots)")
     nr.set_defaults(fn=_cmd_node_run)
 
     h = sub.add_parser("hash", help="sha256 a file or a directory tree, on demand")
     h.add_argument("path", nargs="+")
     h.set_defaults(fn=_cmd_hash)
+
+    _add_files_parser(sub)
+
+    w = sub.add_parser("whoami", help="the node id every verb speaks for")
+    w.add_argument("--json", action="store_true")
+    w.set_defaults(fn=_cmd_whoami)
+
+    mg = sub.add_parser("manage", help="revert a carded manage proposal, list shares"
+                                       " (python -m awstorage.manage)")
+    mg.add_argument("rest", nargs=argparse.REMAINDER)
+    mg.set_defaults(fn=_cmd_manage)
 
     sw = sub.add_parser("sweep", help="retention sweep: measure, guard, harvest, remove"
                                        " (dry-run unless --yes)")

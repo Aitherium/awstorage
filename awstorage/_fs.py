@@ -29,14 +29,16 @@ from __future__ import annotations
 
 import hashlib
 import os
-import socket
 import stat
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
+
+from .identity import whoami
 
 SCHEMA_VERSION = 1
+_REPARSE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 # Directories that are never worth descending into: either they lie about size
 # (reparse/junction targets, /proc) or they are the OS's own business.
@@ -64,6 +66,36 @@ def _norm(p: Path) -> str:
     # Forward slashes everywhere so the same tree has ONE spelling in the
     # catalog whether it was scanned from Windows, WSL, or a Linux node.
     return str(p).replace("\\", "/")
+
+
+def is_reparse(st: os.stat_result) -> bool:
+    """True for a Windows reparse point (junction, mount point, symlink)."""
+    return bool(getattr(st, "st_file_attributes", 0) & _REPARSE)
+
+
+def iter_file_stats(path: str | os.PathLike) -> Iterator[os.stat_result]:
+    """stat of every regular file under `path`, never following a symlink or a
+    reparse point (junction). The walker `policy` uses to size and fingerprint a
+    tree at apply time, so it agrees with `scan` about what is inside it."""
+    stack = [str(path)]
+    while stack:
+        d = stack.pop()
+        try:
+            it = os.scandir(d)
+        except OSError:
+            continue
+        with it:
+            for e in it:
+                try:
+                    st = e.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if e.is_symlink() or is_reparse(st):
+                    continue
+                if stat.S_ISDIR(st.st_mode):
+                    stack.append(e.path)
+                elif stat.S_ISREG(st.st_mode):
+                    yield st
 
 
 def fingerprint(bytes_: int, files: int, newest_mtime: float) -> str:
@@ -148,6 +180,12 @@ def scan(
                         # Junctions too: before 3.12 is_symlink() says False for
                         # one, and its target's bytes are not this tree's bytes.
                         continue
+                    # A Windows junction is NOT a symlink to Python (is_symlink() is
+                    # False) yet points elsewhere: following it double-counts a tree
+                    # and lets a quarantine reach outside the root. Refuse every
+                    # reparse point unless the caller asked to follow links.
+                    if not follow_symlinks and is_reparse(e.stat(follow_symlinks=False)):
+                        continue
                     if e.is_dir(follow_symlinks=follow_symlinks):
                         if e.name == ".git" and owners[-1] in agg:
                             # A git working tree: its build outputs may be TRACKED
@@ -188,7 +226,7 @@ def scan(
 
     return {
         "schema": SCHEMA_VERSION,
-        "node": node or socket.gethostname(),
+        "node": node or whoami(),
         "root": root_key,
         "taken_at": _now_iso(),
         "max_depth": int(max_depth),
