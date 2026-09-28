@@ -659,12 +659,12 @@ def test_preset_agent_scratch_end_to_end_via_env(tmp_path: Path):
 
 
 def test_python_dash_m_and_version():
-    assert awstorage.__version__ == "0.3.0"
+    assert awstorage.__version__ == "0.3.1"
     r = subprocess.run([sys.executable, "-m", "awstorage", "--version"], cwd=PKG_ROOT,
                        capture_output=True, text=True, timeout=60, check=False)
-    assert r.returncode == 0 and "0.3.0" in r.stdout
+    assert r.returncode == 0 and "0.3.1" in r.stdout
     toml = (PKG_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'version = "0.3.0"' in toml
+    assert 'version = "0.3.1"' in toml
 
 
 def test_sweep_imports_no_sibling_at_module_load():

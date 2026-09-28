@@ -27,6 +27,7 @@ looks complete and is not.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import stat
@@ -345,35 +346,78 @@ def walk_no_follow(root: str | os.PathLike):
         stack.extend(e.path for e in reversed(dirs))
 
 
-def remove_tree(path: str | os.PathLike) -> tuple[int, list[str]]:
-    """Delete a file or tree without following any link. Returns (bytes, errors).
+# Windows: 5 = access denied (an open handle without FILE_SHARE_DELETE, or a
+# delete-pending file), 32 = sharing violation, 33 = lock violation.
+BUSY_WINERRORS = (5, 32, 33)
+# rmdir on a directory still holding a busy file: ERROR_DIR_NOT_EMPTY (145) on
+# Windows, ENOTEMPTY / EEXIST elsewhere. A consequence of the busy file, not a new fault.
+_NOT_EMPTY_WINERRORS = (145,)
+_NOT_EMPTY_ERRNOS = (errno.ENOTEMPTY, errno.EEXIST)
 
-    A link at the top or anywhere inside is unlinked; its target is untouched.
-    Errors are collected, not raised: the caller re-stats, so a stubborn file
-    surfaces as bytes that did not go away, never as a silent success.
+
+def is_busy_error(exc: BaseException) -> bool:
+    """Is this OSError "something holds the file open", i.e. a live signal, not a fault?
+
+    PermissionError covers EACCES/EPERM (and Windows winerror 5 / 32 map to it);
+    the winerror check covers a sharing/lock violation raised as a bare OSError.
+    """
+    if not isinstance(exc, OSError):
+        return False
+    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in BUSY_WINERRORS
+
+
+def _is_not_empty(exc: OSError) -> bool:
+    return (getattr(exc, "winerror", None) in _NOT_EMPTY_WINERRORS
+            or exc.errno in _NOT_EMPTY_ERRNOS)
+
+
+def _under(child: str, parent: str) -> bool:
+    c = os.path.normcase(child).rstrip("\\/")
+    p = os.path.normcase(parent).rstrip("\\/")
+    return c == p or c.startswith(p + os.sep) or c.startswith(p + "/")
+
+
+def remove_tree_detail(path: str | os.PathLike) -> tuple[int, list[str], list[str]]:
+    """Delete a file or tree without following any link. Returns (bytes, errors, busy).
+
+    `busy` lists what could not be removed because something holds it open
+    (`is_busy_error`), plus directories left non-empty ONLY because a busy file sits
+    under them. Everything else that failed is in `errors`. Nothing is raised: a
+    busy file stays for the next pass, the rest of the tree is still removed.
     """
     top = long_path(path)
     errors: list[str] = []
+    busy: list[str] = []
+    busy_paths: list[str] = []
     removed = 0
+
+    def fail(p: str, exc: OSError) -> None:
+        if is_busy_error(exc):
+            busy.append(f"{p}: {type(exc).__name__}")
+            busy_paths.append(p)
+        else:
+            errors.append(f"{p}: {type(exc).__name__}")
+
     try:
         st = os.lstat(top)
     except FileNotFoundError:
-        return 0, []
+        return 0, [], []
     except OSError as exc:
-        return 0, [f"{path}: {type(exc).__name__}"]
+        fail(str(path), exc)
+        return 0, errors, busy
     if _stat_is_link(st):
         try:
             unlink_link(top)
         except OSError as exc:
-            errors.append(f"{path}: {type(exc).__name__}")
-        return 0, errors
+            fail(str(path), exc)
+        return 0, errors, busy
     if not stat.S_ISDIR(st.st_mode):
         try:
             _force(os.unlink, top)
             removed += int(st.st_size)
         except OSError as exc:
-            errors.append(f"{path}: {type(exc).__name__}")
-        return removed, errors
+            fail(str(path), exc)
+        return removed, errors, busy
     dirs_in_order: list[str] = []
     for d, _dirs, files, links in walk_no_follow(top):
         dirs_in_order.append(d)
@@ -381,20 +425,37 @@ def remove_tree(path: str | os.PathLike) -> tuple[int, list[str]]:
             try:
                 unlink_link(e.path)
             except OSError as exc:
-                errors.append(f"{e.path}: {type(exc).__name__}")
+                fail(e.path, exc)
         for e in files:
             try:
                 size = e.stat(follow_symlinks=False).st_size
                 _force(os.unlink, e.path)
                 removed += int(size)
             except OSError as exc:
-                errors.append(f"{e.path}: {type(exc).__name__}")
+                fail(e.path, exc)
     for d in reversed(dirs_in_order):  # children before parents
         try:
             _force(os.rmdir, d)
         except OSError as exc:
-            errors.append(f"{d}: {type(exc).__name__}")
-    return removed, errors
+            if _is_not_empty(exc) and any(_under(b, d) for b in busy_paths):
+                busy.append(f"{d}: kept, holds a busy file")
+                busy_paths.append(d)
+            else:
+                fail(d, exc)
+    return removed, errors, busy
+
+
+def remove_tree(path: str | os.PathLike) -> tuple[int, list[str]]:
+    """Delete a file or tree without following any link. Returns (bytes, errors).
+
+    A link at the top or anywhere inside is unlinked; its target is untouched.
+    Errors are collected, not raised: the caller re-stats, so a stubborn file
+    surfaces as bytes that did not go away, never as a silent success. Busy files
+    count as errors here; a caller that tells busy from failed uses
+    `remove_tree_detail`.
+    """
+    removed, errors, busy = remove_tree_detail(path)
+    return removed, errors + busy
 
 
 def contains_link(path: str | os.PathLike) -> bool:

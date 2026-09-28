@@ -758,7 +758,7 @@ def _cmd_sweep(a) -> int:
     print(f"{mode}: rules {', '.join(r['name'] for r in rec['rules']) or '-'}; "
           f"{rec['items_seen']} seen, {rec['items_eligible']} eligible, "
           f"{rec['kept_fresh']} fresh, {len(rec['skipped_live'])} live, "
-          f"{len(rec['skipped_busy'])} busy")
+          f"{len(rec.get('busy') or rec['skipped_busy'])} busy")
     for it in rec["items"]:
         hv = it.get("harvest") or {}
         extra = ""

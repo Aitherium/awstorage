@@ -56,7 +56,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-from ._fs import is_link, long_path, remove_tree, walk_no_follow
+from ._fs import is_busy_error, is_link, long_path, remove_tree, remove_tree_detail, walk_no_follow
 from .classify import CLASSES
 from .policy import NEVER_AUTO, QUARANTINE_DIRNAME, ApplyRefused, list_quarantine, move_no_follow
 
@@ -711,7 +711,7 @@ def load_live_ids(ids: Iterable[str] = (), ids_file: str | None = None,
 def _is_busy(exc: OSError) -> bool:
     # Windows sharing violation / access denied on a rename = something holds a
     # handle inside: the item is in use, which is a live signal, not a failure.
-    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in (5, 32, 33)
+    return is_busy_error(exc)
 
 
 def _quarantine_item(item: str, base: str, rule_name: str, seq: int) -> tuple[str, str]:
@@ -808,6 +808,11 @@ def sweep(
     when all of it is older than max_idle, and listed in the receipt's `capped`.
     Under `emergency_free_gb`, a rule with `emergency_delete` DELETES (not quarantines)
     an eligible item once its harvest is verified; receipt `emergency_deleted`.
+    A file held open by a running app (PermissionError / Windows sharing violation) is
+    never a failure: on any delete or purge the item is `skipped-busy` (nothing removed)
+    or `partial-busy` (freed bytes counted, the held rest stays for the next pass),
+    listed in receipt `busy`, never counted as removed, exit code unaffected. Any OTHER
+    OSError is still a failure (exit 1).
     """
     from . import integrations as ig  # lazy: its siblings are all optional
 
@@ -836,6 +841,7 @@ def sweep(
         "bytes_purged": 0, "bytes_emergency_deleted": 0, "emergency_deleted": 0,
         "capped": [], "measure_cap_s": measure_cap_s,
         "files_harvested": 0, "withheld_secret": 0, "skipped_live": [], "skipped_busy": [],
+        "busy": [],
         "kept_fresh": 0, "errors": [], "could_not_judge": [], "warnings": [], "notes": [],
         "emergency": [], "free_before": {}, "free_after": {}, "items": [], "purged": [],
         "harvest_to": (f"strata:{strata.tier}" if strata else str(shelf).replace("\\", "/")),
@@ -1267,13 +1273,33 @@ def _one_item(rec: dict, *, item: str, base: str, rule: dict, include_rx, exclud
                action=act)
         return keep("failed", "audit append failed under --require-audit; item kept",
                     error=True)
+    def busy_left(removed: int, busy: list[str]) -> None:
+        # Something holds a file inside open (a running app's lockfile): the rest of
+        # the item is gone, the held part stays for the next pass. A live signal, not
+        # a failure -- and never counted as removed.
+        outcome = "partial-busy" if removed else "skipped-busy"
+        rec["busy"].append({"path": item, "rule": rule["name"], "action": act,
+                            "outcome": outcome, "bytes_freed": removed,
+                            "busy": len(busy), "first": busy[0]})
+        if not removed:
+            rec["skipped_busy"].append(item)
+        why = f"{len(busy)} busy path(s), first {busy[0]}"
+        audit(outcome, path=item, rule=rule["name"], stage=act, bytes=removed, why=why)
+        ledger(item, rule, outcome, removed, why, action=act)
+        row["bytes_freed"] = removed
+        keep(outcome, (f"in use: freed {removed} bytes, {why}; the rest stays for the "
+                       f"next pass") if removed else f"in use: {why}; untouched")
+
     try:
         if emergency_del:
-            removed, errs = remove_tree(item)
+            removed, errs, busy = remove_tree_detail(item)
             rec["bytes_freed"] += removed
             rec["bytes_emergency_deleted"] += removed
             if credit:
                 credit(item, removed)
+            if not errs and busy:
+                return busy_left(removed, busy)
+            errs = errs + busy
             if errs:
                 audit("failed", path=item, rule=rule["name"], stage=act, why=errs[0])
                 ledger(item, rule, "failed", removed, f"{len(errs)} error(s): {errs[0]}",
@@ -1285,7 +1311,13 @@ def _one_item(rec: dict, *, item: str, base: str, rule: dict, include_rx, exclud
                       f"{float(emergency_free_gb):g} GB; harvest verified at {h['dir']})")
             row["bytes_freed"] = removed
         elif rule["action"] == "delete":
-            removed, errs = remove_tree(item)
+            removed, errs, busy = remove_tree_detail(item)
+            if not errs and busy:
+                rec["bytes_freed"] += removed
+                if credit:
+                    credit(item, removed)
+                return busy_left(removed, busy)
+            errs = errs + busy
             if errs:
                 audit("failed", path=item, rule=rule["name"], stage="delete", why=errs[0])
                 ledger(item, rule, "failed", removed, f"{len(errs)} error(s): {errs[0]}")
@@ -1304,6 +1336,9 @@ def _one_item(rec: dict, *, item: str, base: str, rule: dict, include_rx, exclud
     except (OSError, ApplyRefused) as exc:
         if isinstance(exc, OSError) and _is_busy(exc):
             rec["skipped_busy"].append(item)
+            rec["busy"].append({"path": item, "rule": rule["name"], "action": act,
+                                "outcome": "skipped-busy", "bytes_freed": 0, "busy": 1,
+                                "first": f"{item}: {type(exc).__name__}"})
             ledger(item, rule, "skipped-busy", detail=type(exc).__name__)
             audit("skipped-busy", path=item, rule=rule["name"], why=type(exc).__name__)
             return keep("skipped-busy", f"in use ({type(exc).__name__}); untouched")
@@ -1360,16 +1395,29 @@ def _purge(rec: dict, rule: dict, bases: list[str], *, dry_run: bool, t_now: flo
                 rec["purged"].append(row)
                 rec["errors"].append(f"{entry}: purge refused, audit append failed")
                 continue
-            removed, errs = remove_tree(entry)
+            removed, errs, busy = remove_tree_detail(entry)
             rec["bytes_freed"] += removed
             rec["bytes_purged"] += removed
             if credit:
                 credit(base, removed)
-            row.update(outcome="purged" if not errs else "failed", bytes=removed)
+            if errs:
+                errs = errs + busy
+                outcome = "failed"
+            elif busy:
+                # A held file in a quarantine entry: the entry stays for the next pass.
+                outcome = "partial-busy" if removed else "skipped-busy"
+                rec["busy"].append({"path": entry, "rule": rule["name"], "action": "purge",
+                                    "outcome": outcome, "bytes_freed": removed,
+                                    "busy": len(busy), "first": busy[0]})
+            else:
+                outcome = "purged"
+            row.update(outcome=outcome, bytes=removed)
             rec["purged"].append(row)
-            ledger(entry, rule, "purged" if not errs else "failed", removed,
-                   f"quarantine purge (origin {q['origin']})" + (f"; {errs[0]}" if errs else ""))
-            audit("purged", path=entry, rule=rule["name"], bytes=removed, errors=len(errs))
+            note = errs[0] if errs else busy[0] if busy else ""
+            ledger(entry, rule, outcome, removed,
+                   f"quarantine purge (origin {q['origin']})" + (f"; {note}" if note else ""))
+            audit("purged", path=entry, rule=rule["name"], bytes=removed, errors=len(errs),
+                  busy=len(busy))
             if errs:
                 rec["errors"].append(f"{entry}: purge incomplete: {errs[0]}")
 

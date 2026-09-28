@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.1 -- 2026-09-28
+
+The live 3-hourly sweep (2026-09-28, 0.2.1) freed 35 GB in an emergency (C: 9.3 GB ->
+44.6 GB free) and still exited 1: ONE Qt lockfile under %TEMP%, held open by a running
+app, raised PermissionError during the emergency delete ("emergency delete incomplete:
+1 error(s)"). A scheduled job that exits 1 on every in-use lockfile has a useless receipt.
+
+### Fixed
+- A file held open (PermissionError, Windows winerror 5/32/33) on ANY delete path --
+  emergency delete, `action: delete`, quarantine purge -- is no longer a failure. The
+  item is `skipped-busy` when nothing was removed, `partial-busy` when some was (freed
+  bytes counted, the held rest stays for the next pass); exit code unaffected. A busy
+  item is never counted as removed. Any OTHER OSError is still a failure (exit 1), also
+  when it occurs alongside a busy file.
+
+### Added
+- Receipt `busy`: one row per busy item (`path`, `rule`, `action`, `outcome`,
+  `bytes_freed`, `busy`, `first`). `skipped_busy` keeps its meaning (item untouched).
+- `awstorage._fs.remove_tree_detail` -> `(bytes, errors, busy)` and `is_busy_error`;
+  `remove_tree` is unchanged for its other callers (busy counts as an error there).
+- Self-test check 9: a held file in an emergency delete is `partial-busy`, exit 0; a
+  non-permission OSError still exits 1.
+
 ## 0.3.0 -- 2026-09-28
 
 The per-file index and the manage plane in one CLI.

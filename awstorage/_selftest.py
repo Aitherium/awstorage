@@ -11,6 +11,8 @@ loudly if the guard did NOT fire -- a self-test that can only pass is decoration
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import json
 import os
 import shutil
@@ -49,6 +51,31 @@ def _mk(p: Path, data: bytes, age_h: float = 0.0) -> Path:
         t = time.time() - age_h * 3600
         os.utime(p, (t, t))
     return p
+
+
+@contextlib.contextmanager
+def _held(path: Path, kind: type):
+    """Make os.unlink fail on `path` with `kind` (PermissionError = held open by an
+    app; OSError = a genuine I/O fault). On Windows PermissionError is a REAL handle
+    (CPython opens without FILE_SHARE_DELETE, so unlink hits a sharing violation)."""
+    if kind is PermissionError and os.name == "nt":
+        with open(path, "rb"):
+            yield
+        return
+    real = os.unlink
+    name = path.name
+
+    def unlink(p, *a, **k):
+        if os.path.basename(os.fspath(p)) == name:
+            if kind is PermissionError:
+                raise PermissionError(errno.EACCES, "held open (simulated)", str(p))
+            raise OSError(errno.EIO, "I/O error (simulated)", str(p))
+        return real(p, *a, **k)
+    os.unlink = unlink
+    try:
+        yield
+    finally:
+        os.unlink = real
 
 
 def _policy(root: Path, **over) -> dict:
@@ -188,6 +215,27 @@ def run() -> int:
         verdict = {Path(c["path"]).name: c["verdict"] for c in rec["capped"]}
         check(verdict == {"old": "eligible", "warm": "live"},
               "measure cap: capped old item eligible, capped item with a fresh file live")
+
+        # 9. a file held open during an emergency delete is BUSY, not a failure: the
+        #    rest is freed, exit 0, receipt `busy`; any other OSError still exits 1.
+        br = td_p / "busy"
+        _mk(br / "sess-b" / "big.bin", b"\x00" * 8192, 30)
+        lock = _mk(br / "sess-b" / "lockfile", b"pid", 30)
+        os.utime(br / "sess-b", (time.time() - 30 * 3600,) * 2)
+        bpol = _policy(br, action="quarantine", emergency_delete=True)
+        with _held(lock, PermissionError):
+            rec = sweep(policy=bpol, dry_run=False, harvest_to=shelf, seal=False,
+                        emergency_free_gb=1, disk_free=lambda _p: 0)
+        b = rec.get("busy") or [{}]
+        check(rec["exit_code"] == 0 and b[0].get("outcome") == "partial-busy"
+              and rec["bytes_freed"] >= 8192 and rec["items_removed"] == 0
+              and lock.exists() and not (br / "sess-b" / "big.bin").exists(),
+              "held file in an emergency delete: partial-busy, bytes counted, exit 0")
+        with _held(lock, OSError):
+            rec = sweep(policy=bpol, dry_run=False, harvest_to=shelf, seal=False,
+                        emergency_free_gb=1, disk_free=lambda _p: 0)
+        check(rec["exit_code"] == 1 and not rec.get("busy") and lock.exists(),
+              "non-permission OSError in an emergency delete: still a failure, exit 1")
 
     if fails:
         print(f"self-test FAIL: {len(fails)} sweep guard(s) did not fire")
