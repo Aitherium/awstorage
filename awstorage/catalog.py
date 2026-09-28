@@ -76,7 +76,57 @@ CREATE TABLE IF NOT EXISTS ledger (
   bytes INTEGER NOT NULL DEFAULT 0,
   detail TEXT
 );
+CREATE TABLE IF NOT EXISTS suggestions (
+  id INTEGER PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  node TEXT NOT NULL,
+  path TEXT NOT NULL,
+  path_key TEXT NOT NULL,
+  action TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  suggested_by TEXT NOT NULL,
+  evidence TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL,
+  prev_status TEXT,
+  why TEXT,
+  cls TEXT,
+  size INTEGER,
+  files INTEGER,
+  newest_mtime REAL,
+  capped INTEGER NOT NULL DEFAULT 0,
+  checks TEXT NOT NULL DEFAULT '[]',
+  expires_at TEXT,
+  card_id TEXT,
+  card_raised TEXT,
+  approved_at TEXT,
+  resolved_by TEXT,
+  applied_at TEXT,
+  outcome TEXT,
+  bytes_freed INTEGER NOT NULL DEFAULT 0,
+  quarantine TEXT,
+  harvest TEXT,
+  reverted_at TEXT,
+  purged_at TEXT
+);
+CREATE INDEX IF NOT EXISTS suggestions_path ON suggestions(path_key, status);
+CREATE INDEX IF NOT EXISTS suggestions_agent ON suggestions(suggested_by);
 """
+
+#: Columns of `suggestions` a caller may update (everything but the identity fields).
+_SUGGESTION_MUTABLE = frozenset({
+    "status", "prev_status", "why", "cls", "size", "files", "newest_mtime", "capped",
+    "checks", "expires_at", "card_id", "card_raised", "approved_at", "resolved_by",
+    "applied_at", "outcome", "bytes_freed", "quarantine", "harvest", "reverted_at",
+    "purged_at",
+})
+#: Suggestion status -> the coarse status its `proposals` row mirrors (dashboards).
+_SUGGESTION_TO_PROPOSAL = {
+    "refused": "refused", "pending-card": "proposed", "auto-approved": "approved",
+    "approved": "approved", "executing": "executing", "rejected": "rejected",
+    "applied": "applied", "reverted": "applied", "drifted": "drifted",
+    "failed": "failed", "expired": "expired",
+}
 
 _STATUSES = {"proposed", "approved", "rejected", "applied", "expired", "snoozed",
              "executing", "drifted", "refused", "failed"}
@@ -255,6 +305,130 @@ class Catalog:
                 (_now(), proposal_id, node, path, action, outcome, int(bytes_), detail),
             )
         return int(cur.lastrowid)
+
+    # -- suggestions (agents propose deletions; awstorage.suggest) -------------------
+
+    @staticmethod
+    def _suggestion_row(r: sqlite3.Row) -> dict:
+        d = dict(r)
+        d["evidence"] = json.loads(d.get("evidence") or "{}")
+        d["checks"] = json.loads(d.get("checks") or "[]")
+        d["harvest"] = json.loads(d["harvest"]) if d.get("harvest") else None
+        d["capped"] = bool(d.get("capped"))
+        return d
+
+    def put_suggestion(self, s: dict) -> int:
+        """Insert a suggestion. Its id IS a `proposals` row id, so a decision card's
+        `proposal_id: <id>` fact names exactly one thing across every plane that
+        files proposals here (policy, manage, suggestions). The proposal row's action
+        is `suggest:<action>` -- outside the closed ACTIONS vocabulary on purpose, so
+        `policy.apply` refuses it and only `awstorage.suggest` can act on it."""
+        now = _now()
+        with self._db:
+            cur = self._db.execute(
+                "INSERT INTO proposals(created_at, snapshot_id, node, path, action, bytes,"
+                " cls, policy_rule, auto, status, fingerprint, note)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (now, None, s["node"], s["path"], f"suggest:{s['action']}",
+                 int(s.get("size") or 0), s.get("cls") or "unknown",
+                 f"suggest:{s['suggested_by']}",
+                 1 if s["status"] == "auto-approved" else 0,
+                 _SUGGESTION_TO_PROPOSAL.get(s["status"], "proposed"), None,
+                 (s.get("reason") or "")[:500]))
+            sid = int(cur.lastrowid)
+            self._db.execute(
+                "INSERT INTO suggestions(id, created_at, updated_at, node, path, path_key,"
+                " action, reason, suggested_by, evidence, status, why, cls, size, files,"
+                " newest_mtime, capped, checks, expires_at, approved_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sid, now, now, s["node"], s["path"], s["path_key"], s["action"],
+                 s["reason"], s["suggested_by"],
+                 json.dumps(s.get("evidence") or {}, sort_keys=True, default=str),
+                 s["status"], s.get("why"), s.get("cls"), s.get("size"), s.get("files"),
+                 s.get("newest_mtime"), 1 if s.get("capped") else 0,
+                 json.dumps(s.get("checks") or []), s.get("expires_at"),
+                 now if s["status"] == "auto-approved" else None))
+        return sid
+
+    def get_suggestion(self, sid: int) -> dict | None:
+        r = self._db.execute("SELECT * FROM suggestions WHERE id = ?", (int(sid),)).fetchone()
+        return self._suggestion_row(r) if r else None
+
+    def list_suggestions(self, status: str | list[str] | tuple | None = None, *,
+                         agent: str | None = None, path_key: str | None = None,
+                         limit: int = 50) -> list[dict]:
+        q = "SELECT * FROM suggestions"
+        cond, args = [], []
+        if status:
+            sts = [status] if isinstance(status, str) else list(status)
+            cond.append("status IN (" + ",".join("?" * len(sts)) + ")")
+            args += sts
+        if agent:
+            cond.append("suggested_by = ?")
+            args.append(agent)
+        if path_key:
+            cond.append("path_key = ?")
+            args.append(path_key)
+        if cond:
+            q += " WHERE " + " AND ".join(cond)
+        q += " ORDER BY id DESC LIMIT ?"
+        args.append(int(limit))
+        return [self._suggestion_row(r) for r in self._db.execute(q, args)]
+
+    def update_suggestion(self, sid: int, *, expect_status: str | tuple | list | None = None,
+                          **fields) -> bool:
+        """Update fields; with `expect_status`, only when the row is still in it (a
+        compare-and-set, so two passes never both act on one suggestion)."""
+        bad = set(fields) - _SUGGESTION_MUTABLE
+        if bad:
+            raise ValueError(f"not updatable: {sorted(bad)}")
+        for k in ("checks", "harvest"):
+            if k in fields and not isinstance(fields[k], (str, type(None))):
+                fields[k] = json.dumps(fields[k], sort_keys=True, default=str)
+        if "capped" in fields:
+            fields["capped"] = 1 if fields["capped"] else 0
+        fields["updated_at"] = _now()
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        args = list(fields.values())
+        q = f"UPDATE suggestions SET {sets} WHERE id = ?"
+        args.append(int(sid))
+        if expect_status is not None:
+            sts = [expect_status] if isinstance(expect_status, str) else list(expect_status)
+            q += " AND status IN (" + ",".join("?" * len(sts)) + ")"
+            args += sts
+        with self._db:
+            cur = self._db.execute(q, args)
+            ok = cur.rowcount == 1
+            if ok and "status" in fields:
+                self._db.execute(
+                    "UPDATE proposals SET status = ? WHERE id = ?",
+                    (_SUGGESTION_TO_PROPOSAL.get(fields["status"], "proposed"), int(sid)))
+        return ok
+
+    def suggestion_counts(self, agent: str | None = None) -> list[dict]:
+        """Per-agent outcome counts, DERIVED from the suggestion rows (one truth, so
+        the trust ledger can never drift from what actually happened)."""
+        q = ("SELECT suggested_by AS agent, COUNT(*) AS made,"
+             " SUM(approved_at IS NOT NULL) AS approved,"
+             " SUM(status = 'rejected') AS rejected,"
+             " SUM(applied_at IS NOT NULL) AS applied,"
+             " SUM(reverted_at IS NOT NULL) AS reverted,"
+             " SUM(status = 'refused') AS refused,"
+             " SUM(status IN ('pending-card', 'auto-approved', 'approved')) AS open,"
+             " MAX(created_at) AS last_at"
+             " FROM suggestions")
+        args: list = []
+        if agent is not None:
+            q += " WHERE suggested_by = ?"
+            args.append(agent)
+        q += " GROUP BY suggested_by ORDER BY suggested_by"
+        out = []
+        for r in self._db.execute(q, args):
+            d = dict(r)
+            for k in ("made", "approved", "rejected", "applied", "reverted", "refused", "open"):
+                d[k] = int(d.get(k) or 0)
+            out.append(d)
+        return out
 
     def list_ledger(self, limit: int = 200) -> list[dict]:
         return [dict(r) for r in self._db.execute(

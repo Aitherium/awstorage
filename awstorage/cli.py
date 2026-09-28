@@ -27,6 +27,12 @@
                     [--receipt PATH] [--json]
     awstorage audit verify [--audit-log PATH]
     awstorage harvest verify <shelf> | harvest publish <day-dir> --to <target>
+    awstorage suggest PATH --reason R --by AGENT [--action A] [--evidence JSON]
+    awstorage suggestions [--status S] | suggestion approve|reject|revert ID [--card F]
+    awstorage apply-suggestions [--yes] | trust
+    awstorage watch --floors C:=40,D:=60,E:=30 [--once] [--yes] [--receipt P]
+    awstorage place --size 90GB [--from PATH] [--to D] [--floors ...]
+    awstorage shelf prune --older-than 30d [--yes]
     awstorage --self-test            (also: python -m awstorage --self-test)
 
 Exit 0 on success, 1 when a proposal is REFUSED (the refusal is the answer) or a
@@ -746,6 +752,7 @@ def _cmd_sweep(a) -> int:
         land_to_awm=a.land_to_awm, awm_db=a.awm_db, snapshot_store=a.snapshot_store,
         time_budget_s=a.time_budget or None,
         measure_cap_s=None if a.measure_cap_s < 0 else a.measure_cap_s,
+        floors=a.floors,
     )
     if a.json:
         print(json.dumps(rec, indent=1, sort_keys=True, default=str))
@@ -790,6 +797,10 @@ def _cmd_sweep(a) -> int:
         print(f"  note: {n}")
     for w in rec["warnings"]:
         print(f"  warning: {w}")
+    for h in rec.get("harvest_skipped", []):
+        print(f"  harvest-skipped: {h['path']} -- {h['why']}")
+    for g in rec.get("skipped_git", []):
+        print(f"  skipped-git: {g['path']} -- {g['why']}")
     for e in rec["errors"]:
         print(f"  FAILED: {e}", file=sys.stderr)
     for e in rec["could_not_judge"]:
@@ -1096,6 +1107,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="land one awm memory per harvested item at SCOPE")
     sw.add_argument("--awm-db", help="awm db (default: awm's own)")
     sw.add_argument("--snapshot-store", help="awrecover store for rules with snapshot: true")
+    sw.add_argument("--floors", help="C:=40,E:=30 (GB): an item is KEPT rather than harvested"
+                                     " onto a shelf drive under its floor (default"
+                                     " $AWSTORAGE_FLOORS)")
     sw.set_defaults(fn=_cmd_sweep)
 
     au = sub.add_parser("audit", help="verify the sweep audit log (awdit)")
@@ -1116,6 +1130,9 @@ def main(argv: list[str] | None = None) -> int:
     hvp.add_argument("--seal-key")
     hvp.add_argument("--json", action="store_true")
     hv.set_defaults(fn=_cmd_harvest)
+
+    from .cli_suggest import add_parsers
+    add_parsers(sub)
 
     a = ap.parse_args(argv)
     if a.self_test:

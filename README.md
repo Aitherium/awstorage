@@ -180,6 +180,125 @@ receipt = awstorage.sweep(["agent-scratch"], dry_run=False,
                           live_ids=["<my-session-id>"])
 ```
 
+## Agents suggest deletions
+
+Dead agent sessions held 106 GB on 2026-09-28 until a person found them by hand -- and
+the agents that made them knew they were dead. `suggest` lets any agent say so, and
+gives it no power beyond saying so:
+
+```bash
+awstorage suggest C:/Users/me/AppData/Local/Temp/claude/proj/4f2e... \
+    --reason "my session ended 2 days ago" --by lyra \
+    --evidence '{"bytes": 113800000000, "idle_hours": 48}'
+awstorage suggestions                       # every suggestion, newest first
+awstorage suggestion approve 42 --card card.json   # a decision card, never a bare yes
+awstorage suggestion reject 42
+awstorage apply-suggestions                 # dry run: the plan
+awstorage apply-suggestions --yes           # re-verify, harvest, quarantine, ledger
+awstorage suggestion revert 42              # put it back (and the agent's trust pays)
+awstorage trust                             # the per-agent ledger
+```
+
+```python
+r = awstorage.suggest(path, reason="session ended", suggested_by="lyra",
+                      action="quarantine", evidence={"bytes": n, "idle_hours": 48})
+# {"id": 42, "status": "auto-approved"|"pending-card"|"refused"|"duplicate",
+#  "why": "...", "class": "build-temp", "size": 113800000000, "checks": [...]}
+awstorage.suggestions(status="pending-card")
+awstorage.resolve_suggestion(42, "approve", card=card)
+awstorage.apply_suggestions(dry_run=False, harvest_to="E:/AitherOS-Data/harvest")
+```
+
+- **Validated twice** -- at suggest time and again at apply time; each step is a named
+  entry in `checks`. Refused: a path that does not exist or is a link; under the never /
+  sensitive / OS set, a quarantine, a volume root, the home dir or a path awstorage
+  depends on; inside a git work tree that is dirty, has commits no remote holds, or that
+  git cannot judge (walks up for `.git`; `git status --porcelain`, `git rev-list @{u}..`
+  and `HEAD --not --remotes`, each with a timeout); any file changed within the live
+  window (2 h) or a path segment registered live (`AWSTORAGE_LIVE_IDS`); evidence that
+  contradicts the measurement. A second open suggestion for the same path is a
+  `duplicate` of the first.
+- **Two lanes.** `auto-approved` only when ALL hold: a regenerable class (`build-temp`,
+  `package-cache`; agent scratch and temp resolve to `build-temp` through the sweep
+  presets, but a tree that names itself `dataset`/`repo`/... keeps that class), action
+  `quarantine` (never delete, never archive), the evidence verifies (at least one of
+  `bytes`, `files`, `idle_hours`, `cls` checked and none contradicted), no nested work
+  tree is dirty or unjudged, and the agent's trust clears the threshold. Everything else
+  is `pending-card`: a decision card is raised through `awstorage.suggest.set_card_hook`
+  (none by default: it waits in `suggestions`). Approving one needs a card that passes
+  `awstorage.manage.verify_card` -- the same owner / surface / attestation checks manage
+  applies -- so while `manage.STORE_ATTESTS_ANSWERER` is False every approval is refused,
+  and it flips only where manage flips it. Rejecting needs no card.
+- **Apply re-verifies.** Re-validation refused, or size / file count / newest mtime moved
+  since the suggestion -> `drifted`, nothing touched. An auto approval whose agent's
+  trust has since fallen goes back to `pending-card`. Then harvest first (the sweep's
+  verified harvest), then a quarantine under `<parent>/.awstorage-quarantine/suggest-<id>-*`
+  (`awstorage revert` works; purged after 72 h) -- or, card-approved only, a delete or an
+  archive through `set_archive_hook`. Every step is a ledger row; the outcome is recorded
+  on the suggestion.
+- **Trust** is derived from the suggestion rows, never a separate counter:
+  `trust = (applied - 3*reverted + 1) / (applied + rejected + 2)` (Laplace-smoothed).
+  A new agent scores 0.50, under the default threshold 0.6 (`AWSTORAGE_TRUST_THRESHOLD`,
+  clamped to at least 0.51), so its first suggestions go to cards; one revert of an
+  applied suggestion costs three applications. `suggested_by` is declared by the caller:
+  a transport that authenticates agents (MCP, awdk) must stamp it from the
+  authenticated identity.
+
+## Keep drives above their floors
+
+```bash
+awstorage watch --floors C:=40,D:=60,E:=30 --once --receipt ~/.aither/awstorage/watch.json
+awstorage watch --floors C:=40,D:=60,E:=30 --once --yes      # let the emergency sweep act
+awrise add --name awstorage-watch --every 5m --timeout 300 -- awstorage watch --floors C:=40,D:=60,E:=30 --once --yes --receipt ~/.aither/awstorage/watch.json
+```
+
+The 3-hourly sweep is too slow for a drive that falls 124 -> 18 GB in an hour. `watch`
+is one `disk_usage` per floored drive: with every drive above its floor it walks no tree
+and finishes in milliseconds. Under a floor it runs the emergency sweep of the presets
+(`--rules`, default `agent-scratch,temp-toplevel`) on THAT drive only -- a plan unless
+`--yes` -- appends an alert to `~/.aither/awstorage/alerts.jsonl`, and runs
+`$AWSTORAGE_ALERT_CMD` with the alert JSON as its last argument (a JSON list such as
+`["awrelay", "send", "#agents"]`, or a shell-like string; never run through a shell),
+so awrelay / Pulse plug in without being imported. Exit 0 all above, 1 a drive still
+under its floor, 2 could not judge. `$AWSTORAGE_FLOORS` holds the same spelling.
+
+## Before moving data between drives
+
+```bash
+awstorage place --size 90GB --from C:/data/models --floors C:=40,D:=60,E:=30
+awstorage place --size 90GB --to C: --floors C:=40      # exit 1: refused
+```
+
+`place` ranks every drive by its free space AFTER the move and refuses any that would
+end under its floor (unlisted drives: `--default-floor-gb`, 20). Run it before moving
+data -- on 2026-09-28 a peer moved 89 GB onto a nearly-full C:. Python:
+`awstorage.place("90GB", {"C:": 40, "E:": 30}, source="D:/models")`.
+
+## Shelf safety
+
+The harvest shelf is a drive too (E: sat at 99 %). With floors set (`--floors` on
+`sweep`, `$AWSTORAGE_FLOORS` for `apply-suggestions`), an item whose harvest would be
+written onto a shelf drive under its floor is KEPT (`harvest-skipped: shelf drive low`)
+-- never removed without its harvest. The one exception: an act that deletes the item
+from the shelf's own drive (a `delete` rule or an emergency delete) repays the copy at
+once, so the emergency on a full C: with the shelf on C: still frees space. Rotate the
+shelf with `awstorage shelf prune --older-than 30d [--yes]` (the date in the day dir's
+name decides, not its mtime).
+
+## Agent worktrees
+
+```json
+{"retention": [{"name": "agent-worktrees", "paths": ["C:/.worktrees/*", "C:/wt/*"]}]}
+```
+
+`awstorage sweep --rules agent-worktrees --policy wt.json --yes`: idle 7 d, quarantine,
+purge after 7 d. Opt-in twice -- named, and its paths come from the policy. Every item
+must be a git work tree ROOT whose status is clean and whose commits a remote holds;
+dirty, ahead, not a repo, or unjudgeable -> `skipped-git`, kept. git's own worktree
+registry must then be pruned by the tool that owns it (`git worktree prune`); never
+`git worktree remove`, which follows junctions (it deleted a shared `node_modules` on
+2026-09-22).
+
 ## The three rules
 
 - **Measure before you delete.** A `du` answers one question once.

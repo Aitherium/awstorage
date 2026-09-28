@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.4.0 -- 2026-09-28
+
+Measured the same day: dead agent sessions held 106 GB until found by hand; D: hit 0
+bytes at 12:15 and C: fell 124 -> 18 GB inside an hour while the sweep runs every 3 h; a
+peer moved 89 GB onto the nearly-full C:; agent worktrees held 130 GB uncovered; the
+harvest shelf sat on E: at 99 %; nothing learned which suggestions were right.
+
+### Added
+- **Suggestions** (`awstorage.suggest`): `suggest(path, *, reason, suggested_by,
+  action="quarantine", evidence=None, ttl_days=7.0, catalog=None)`,
+  `suggestions(status=None, limit=50, catalog=None)`,
+  `resolve_suggestion(id, decision, *, card=None, catalog=None)`,
+  `apply_suggestions(*, dry_run=True, harvest_to=None, catalog=None)`,
+  `revert_suggestion(id, *, catalog=None)`, `trust(agent=None, *, catalog=None)`,
+  `set_card_hook`, `set_archive_hook`. Named validation checks; auto lane only for a
+  regenerable quarantine with verified evidence from a trusted agent; everything else
+  is card-only through `manage.verify_card` (refused while the store does not attest
+  the answerer). Apply re-validates and refuses on drift, harvests first, ledgers and
+  records the outcome; reverts (also via `awstorage revert`) are detected. CLI:
+  `suggest`, `suggestions`, `suggestion approve|reject|revert`, `apply-suggestions`,
+  `trust`.
+- **Trust ledger**, derived from the suggestion rows:
+  `(applied - 3*reverted + 1) / (applied + rejected + 2)`; threshold 0.6
+  (`AWSTORAGE_TRUST_THRESHOLD`, clamped >= 0.51 so a new agent never auto-approves).
+- `awstorage.gitcheck`: clean + pushed judgement (`git status --porcelain`,
+  `rev-list @{u}..`, `HEAD [--branches] --not --remotes`), timeouts, fail closed.
+- **watch** (`awstorage.space.watch_once`, `awstorage watch`): floors per drive, a
+  no-walk fast path, emergency sweep of the presets on the drive under its floor,
+  alerts to `~/.aither/awstorage/alerts.jsonl` + `$AWSTORAGE_ALERT_CMD`.
+- **place** (`awstorage.place`, `awstorage place`): rank drives by free space after a
+  move; refuse any that would end under its floor.
+- **Shelf safety**: `sweep(floors=...)` / `--floors` / `$AWSTORAGE_FLOORS` keep an item
+  (`harvest-skipped`) rather than harvest onto a shelf drive under its floor (unless the
+  act deletes the item from that same drive); `awstorage shelf prune --older-than 30d`.
+- Preset `agent-worktrees` (paths from `--policy`; idle 7d; quarantine;
+  `require_git_clean`). Rule key `require_git_clean` (quarantine rules only): items that
+  are not a clean, fully pushed git work tree root are kept (`skipped-git`).
+- Catalog table `suggestions` (additive; an older catalog opens). A suggestion's id is
+  a `proposals` row id with action `suggest:<action>`, which `policy.apply` refuses.
+- Self-test checks 10-14: suggest refuses a dirty work tree, the auto lane never
+  deletes, watch fires under a floor (and not above it), place refuses a move below a
+  floor, a low shelf drive keeps the item.
+
 ## 0.3.1 -- 2026-09-28
 
 The live 3-hourly sweep (2026-09-28, 0.2.1) freed 35 GB in an emergency (C: 9.3 GB ->

@@ -42,6 +42,13 @@ it skips live items, copies the small text that outlives a session to a shelf
 (verified, secrets withheld) BEFORE removing anything, never follows a link, and
 writes a receipt on every exit path.
 
+**Agents suggest; awstorage decides.** `suggest()` lets any agent propose removing
+a path. It validates (guards, git clean + pushed, live window, evidence), then
+either auto-approves a regenerable quarantine from a trusted agent or files it for
+a decision card; `apply_suggestions()` re-verifies before acting, and every outcome
+feeds the agent's trust score. `watch_once()` keeps drives above their floors
+cheaply; `place()` refuses a move that would push a drive under its floor.
+
 The package is stdlib-only and speaks to nothing. Fleet integration (a scanner
 per node, a catalog behind an API, a GUI, an autonomous steward, model-backed
 classification) lives in the platform that imports it -- awstorage works alone.
@@ -74,9 +81,20 @@ from .policy import (
     revert,
 )
 from .report import rank, summarize
+from .space import parse_floors, place, prune_shelf, watch_once
+from .suggest import (
+    apply_suggestions,
+    resolve_suggestion,
+    revert_suggestion,
+    set_archive_hook,
+    set_card_hook,
+    suggest,
+    suggestions,
+    trust,
+)
 from .sweep import LIVE_IDS_ENV, SweepConfigError, presets, sweep
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -109,5 +127,17 @@ __all__ = [
     "presets",
     "SweepConfigError",
     "LIVE_IDS_ENV",
+    "suggest",
+    "suggestions",
+    "resolve_suggestion",
+    "revert_suggestion",
+    "apply_suggestions",
+    "trust",
+    "set_card_hook",
+    "set_archive_hook",
+    "watch_once",
+    "place",
+    "parse_floors",
+    "prune_shelf",
     "__version__",
 ]

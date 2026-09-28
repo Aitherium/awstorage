@@ -245,6 +245,27 @@ def presets() -> dict[str, dict]:
             "why": "installer/extractor leftovers; ~19k stale entries measured 2026-09-27. "
                    "The agent-scratch tree has its own rule and is excluded here",
         },
+        # OPT-IN twice: named, AND its paths come from the policy (worktree roots are
+        # site-specific: C:/.worktrees/*, C:/wt/* held 130 GB uncovered on 2026-09-28).
+        # Every item must be a git work tree ROOT that is clean and fully pushed
+        # (`require_git_clean`); anything git cannot judge is kept. The owning tool must
+        # then prune git's own worktree registry -- never `git worktree remove`, which
+        # follows junctions (node_modules deleted for every session, 2026-09-22).
+        "agent-worktrees": {
+            "name": "agent-worktrees",
+            "paths": [],
+            "paths_from_policy": True,
+            "class": "repo",
+            "max_idle": "7d",
+            "action": "quarantine",
+            "purge_after": "7d",
+            "harvest": dict(DEFAULT_HARVEST),
+            "live_guard": {"window": DEFAULT_LIVE_WINDOW},
+            "require_git_clean": True,
+            "emergency_delete": False,
+            "why": "idle agent worktrees; only a clean, fully pushed work tree holds "
+                   "nothing that exists only here",
+        },
     }
 
 
@@ -259,6 +280,10 @@ def validate_rule(rule: Mapping[str, Any]) -> dict:
     if isinstance(paths, str):
         paths = [paths]
     if not paths or not all(isinstance(p, str) and p.strip() for p in paths):
+        if rule.get("paths_from_policy"):
+            raise SweepConfigError(f"rule {name}: its `paths` come from --policy (a "
+                                   f"`retention` entry named {name!r} with e.g. "
+                                   "paths: ['C:/.worktrees/*', 'C:/wt/*'])")
         raise SweepConfigError(f"rule {name}: `paths` must be a non-empty list of globs")
     cls = rule.get("class", rule.get("cls", "build-temp"))
     if cls not in CLASSES:
@@ -300,6 +325,11 @@ def validate_rule(rule: Mapping[str, Any]) -> dict:
         raise SweepConfigError(f"rule {name}: emergency_delete requires harvest")
     if snap not in (True, False) and not isinstance(snap, Mapping):
         raise SweepConfigError(f"rule {name}: `snapshot` must be true/false or a mapping")
+    git_clean = rule.get("require_git_clean", False)
+    if git_clean not in (True, False):
+        raise SweepConfigError(f"rule {name}: `require_git_clean` must be true or false")
+    if git_clean and action != "quarantine":
+        raise SweepConfigError(f"rule {name}: require_git_clean rules quarantine only")
     return {
         "name": name,
         "paths": list(paths),
@@ -315,6 +345,7 @@ def validate_rule(rule: Mapping[str, Any]) -> dict:
         },
         "snapshot": snap,
         "emergency_delete": bool(emergency_delete),
+        "require_git_clean": bool(git_clean),
         "why": str(rule.get("why", "")),
     }
 
@@ -340,6 +371,10 @@ def resolve_rules(names: Iterable[str] | None, policy: Mapping[str, Any] | None 
     out, pre = [], presets()
     for n in wanted:
         src = declared.get(n) or pre.get(n)
+        if pre.get(n, {}).get("paths_from_policy") and n in declared:
+            # A preset whose paths are site-specific: the policy entry supplies them
+            # (and may override any other key); the preset keeps its guards.
+            src = {**pre[n], **declared[n]}
         if src is None:
             raise SweepConfigError(f"unknown rule {n!r}; declared: {sorted(declared)}, "
                                    f"presets: {sorted(pre)}")
@@ -790,6 +825,7 @@ def sweep(
     strata_url: str | None = None,
     strata_insecure_http_for_tests: bool = False,
     strata_staging: str | Path | None = None,
+    floors: Mapping[str, float] | str | None = None,
 ) -> dict:
     """One retention pass. Returns the receipt dict (also written to `receipt`).
 
@@ -813,6 +849,13 @@ def sweep(
     or `partial-busy` (freed bytes counted, the held rest stays for the next pass),
     listed in receipt `busy`, never counted as removed, exit code unaffected. Any OTHER
     OSError is still a failure (exit 1).
+    `floors` (``{"C:": 40}`` / ``"C:=40,E:=30"``; None = ``$AWSTORAGE_FLOORS``): when the
+    harvest shelf's drive is under its floor, an item that has something to harvest is
+    KEPT (`harvest-skipped`, receipt `harvest_skipped`) -- never removed without its
+    harvest, and never written onto a full shelf drive -- unless this act deletes the
+    item from that same drive (delete / emergency delete), which repays the copy.
+    A rule with `require_git_clean` keeps (`skipped-git`) every item that is not a git
+    work tree root judged clean and fully pushed (`awstorage.gitcheck`).
     """
     from . import integrations as ig  # lazy: its siblings are all optional
 
@@ -847,10 +890,18 @@ def sweep(
         "harvest_to": (f"strata:{strata.tier}" if strata else str(shelf).replace("\\", "/")),
         "audit": None, "publish": [], "strata": None,
         "node": node or socket.gethostname(), "truncated": False, "resume_first": [],
+        "harvest_skipped": [], "skipped_git": [], "floors": {},
     }
     cat = None
     own_cat = False
     try:
+        from .space import FloorsError, parse_floors
+        try:
+            fl = (dict(floors) if isinstance(floors, Mapping)
+                  else parse_floors(floors, env=env))
+        except FloorsError as exc:
+            raise SweepConfigError(str(exc)) from exc
+        rec["floors"] = fl
         if catalog is not None:
             if hasattr(catalog, "ledger"):
                 cat = catalog
@@ -866,7 +917,7 @@ def sweep(
              land_to_awm=land_to_awm, awm_db=awm_db, snapshot_store=snapshot_store,
              t_now=t_now, env=env, free_fn=free_fn, ig=ig, time_budget_s=time_budget_s,
              measure_cap_s=measure_cap_s,
-             strata=strata, strata_err=strata_err, receipt=receipt,
+             strata=strata, strata_err=strata_err, receipt=receipt, floors=fl,
              protect=[str(p) for p in (receipt, getattr(cat, "path", None), audit_log,
                                        awm_db, snapshot_store) if p])
     except SweepConfigError as exc:
@@ -897,7 +948,8 @@ def _run(rec: dict, *, rules, policy, dry_run, shelf: Path, harvest_offdrive,
          emergency_free_gb, cat, live_ids, live_ids_file, audit_log, require_audit,
          seal_key, seal, publish_to, land_to_awm, awm_db, snapshot_store, t_now, env,
          free_fn, ig, protect: list, time_budget_s: float | None, strata, strata_err,
-         receipt=None, measure_cap_s: float | None = DEFAULT_MEASURE_CAP_S) -> None:
+         receipt=None, measure_cap_s: float | None = DEFAULT_MEASURE_CAP_S,
+         floors: Mapping[str, float] | None = None) -> None:
     node = rec["node"]
     # An item the last pass ran out of budget on goes FIRST this time. Measured
     # 2026-09-27: a 25 GB session tree was cut at the 300 s mark; in sorted order it
@@ -1044,7 +1096,7 @@ def _run(rec: dict, *, rules, policy, dry_run, shelf: Path, harvest_offdrive,
                           land_to_awm=land_to_awm, awm_db=awm_db,
                           snapshot_store=snapshot_store, touched_days=touched_days,
                           deadline=deadline, strata=strata, measure_cap_s=measure_cap_s,
-                          credit=credit)
+                          credit=credit, floors=floors, free_fn=free_fn)
         if rec["truncated"]:
             rec["notes"].append(f"time budget of {human_duration(time_budget_s or 0)} "
                                 "reached; remaining items and later rules wait for the "
@@ -1078,8 +1130,8 @@ def _one_item(rec: dict, *, item: str, base: str, rule: dict, include_rx, exclud
               emergency_free_gb, t_now: float, seq: int, protect: list, free_of,
               emergency_vols: dict, audit, ledger, ig, seal_key, seal, land_to_awm, awm_db,
               snapshot_store, touched_days: set, deadline: float | None, strata=None,
-              measure_cap_s: float | None = DEFAULT_MEASURE_CAP_S, credit=None
-              ) -> None:
+              measure_cap_s: float | None = DEFAULT_MEASURE_CAP_S, credit=None,
+              floors: Mapping[str, float] | None = None, free_fn=None) -> None:
     rec["items_seen"] += 1
     name = os.path.basename(item.rstrip("/"))
     row: dict[str, Any] = {"path": item, "rule": rule["name"], "action": rule["action"]}
@@ -1178,6 +1230,43 @@ def _one_item(rec: dict, *, item: str, base: str, rule: dict, include_rx, exclud
         rec["kept_fresh"] += 1
         return
     rec["items_eligible"] += 1
+
+    if rule.get("require_git_clean"):
+        from .gitcheck import git_state
+        gs = git_state(item)
+        gwhy = None
+        if gs["repo"] is None:
+            gwhy = "not a git work tree (require_git_clean keeps what git cannot vouch for)"
+        elif os.path.normcase(os.path.abspath(gs["repo"])) != os.path.normcase(
+                os.path.abspath(item)):
+            gwhy = f"inside the work tree {gs['repo']}, not a work tree root"
+        elif not gs["clean"]:
+            gwhy = f"git: {gs['why']}"
+        if gwhy:
+            rec["skipped_git"].append({"path": item, "rule": rule["name"], "why": gwhy})
+            audit("skipped-git", path=item, rule=rule["name"], why=gwhy)
+            ledger(item, rule, "skipped-git", detail=gwhy)
+            return keep("skipped-git", gwhy)
+        row["git"] = "clean and pushed"
+
+    if floors and rule["harvest"] is not False:
+        from .space import shelf_low
+        low = shelf_low(shelf, floors, disk_free=free_fn)
+        # The one exception: this act DELETES the item from the shelf's own drive, so
+        # the copy is repaid many times over at once (the emergency case: C: under its
+        # floor with the shelf on C:). A quarantine frees nothing until purge.
+        frees_it = same_volume(str(shelf), item) and (
+            rule["action"] == "delete"
+            or (hot and rule["action"] == "quarantine" and rule.get("emergency_delete")))
+        if low and not frees_it:
+            plan = harvest_item(item, rule, m, shelf, write=False, now=t_now)
+            if plan["dir"]:
+                # Never written onto a full shelf drive, never removed without it.
+                rec["harvest_skipped"].append({"path": item, "rule": rule["name"],
+                                               "why": low})
+                ledger(item, rule, "harvest-skipped", detail=low)
+                audit("harvest-skipped", path=item, rule=rule["name"], why=low)
+                return keep("harvest-skipped", f"harvest-skipped: {low}; item kept")
 
     # HARVEST first. In a dry run this is the plan (selected + screened, not written).
     h = harvest_item(item, rule, m, shelf, write=not dry_run, offdrive=harvest_offdrive,

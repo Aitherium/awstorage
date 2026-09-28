@@ -237,7 +237,107 @@ def run() -> int:
         check(rec["exit_code"] == 1 and not rec.get("busy") and lock.exists(),
               "non-permission OSError in an emergency delete: still a failure, exit 1")
 
+    run_040(check)
     if fails:
         print(f"self-test FAIL: {len(fails)} sweep guard(s) did not fire")
         return 1
     return 0
+
+
+def _git(repo: Path, *args: str) -> bool:
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+           "GIT_CONFIG_NOSYSTEM": "1"}
+    try:
+        r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, env=env,
+                           timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+def run_040(check) -> None:
+    """0.4.0 guards: suggest refuses a dirty worktree, the auto lane never deletes,
+    watch fires under a floor, place refuses a move below a floor, and a low shelf
+    drive keeps the item."""
+    from .catalog import Catalog
+    from .space import place, watch_once
+    from .suggest import apply_suggestions, suggest
+
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        cat = Catalog(td_p / "cat.db")
+        try:
+            # 10. a dirty git work tree is refused (a missing git refuses too: could
+            #     not judge is never clean).
+            repo = td_p / "wt-dirty"
+            repo.mkdir()
+            if not _git(repo, "init", "-q"):
+                (repo / ".git").mkdir()  # no git here: the check must still refuse
+            _mk(repo / "build" / "x.o", b"0" * 64, 30)
+            r = suggest(str(repo / "build"), reason="old build", suggested_by="selftest",
+                        catalog=cat)
+            check(r["status"] == "refused" and any(c.startswith("git: REFUSED")
+                                                   for c in r["checks"]),
+                  "suggest refuses a path inside a dirty/unjudgeable git work tree")
+
+            # 11. the auto lane never deletes: a trusted agent's regenerable DELETE goes
+            #     to a card; its regenerable QUARANTINE is auto and applies as a
+            #     reversible quarantine (ORIGIN written), never an rm.
+            for i in range(5):
+                sid = cat.put_suggestion({
+                    "node": "st", "path": f"/seed/{i}", "path_key": f"/seed/{i}",
+                    "action": "quarantine", "reason": "seed", "suggested_by": "trusted",
+                    "status": "approved"})
+                cat.update_suggestion(sid, status="applied", applied_at="2026-01-01T00:00:00")
+            a = _mk(td_p / "sc" / "build" / "a.o", b"1" * 128, 30).parent
+            b = _mk(td_p / "sc2" / "build" / "b.o", b"2" * 128, 30).parent
+            rd = suggest(str(a), reason="dead", suggested_by="trusted", action="delete",
+                         evidence={"bytes": 128}, catalog=cat)
+            rq = suggest(str(b), reason="dead", suggested_by="trusted",
+                         evidence={"bytes": 128}, catalog=cat)
+            rec = apply_suggestions(dry_run=False, harvest_to=td_p / "shelf", catalog=cat)
+            qs = list((td_p / "sc2" / ".awstorage-quarantine").glob("suggest-*/ORIGIN"))
+            check(rd["status"] == "pending-card" and rq["status"] == "auto-approved"
+                  and a.exists() and not b.exists() and len(qs) == 1
+                  and rec["bytes_freed"] == 0,
+                  "auto lane: delete goes to a card; quarantine applies reversibly, no rm")
+
+            # 12. watch: a drive under its floor runs the emergency sweep + alerts.
+            called: list = []
+
+            def fake_sweep(names, **kw):
+                called.append((names, kw.get("emergency_free_gb")))
+                return {"exit_code": 0, "bytes_freed": 0}
+
+            rec = watch_once({td: 40.0}, disk_free=lambda _p: 1 * 2**30,
+                             sweep_fn=fake_sweep, alerts_path=td_p / "alerts.jsonl",
+                             rules=("temp-toplevel",))
+            alerts = (td_p / "alerts.jsonl").read_text(encoding="utf-8") \
+                if (td_p / "alerts.jsonl").exists() else ""
+            check(rec["exit_code"] == 1 and rec["under"] == [td] and bool(called)
+                  and called[0][1] == 40.0 and '"awstorage.floor"' in alerts,
+                  "watch under a floor: emergency sweep ran on that drive, alert written")
+            rec = watch_once({td: 1.0}, disk_free=lambda _p: 50 * 2**30,
+                             sweep_fn=fake_sweep, alerts_path=td_p / "alerts2.jsonl")
+            check(rec["exit_code"] == 0 and len(called) == 1
+                  and not (td_p / "alerts2.jsonl").exists(),
+                  "watch above every floor: no sweep, no alert, exit 0")
+
+            # 13. place refuses a target the move would push under its floor.
+            rows = place("90GB", {td: 40.0}, drives=[td], disk_free=lambda _p: 100 * 2**30)
+            check(len(rows) == 1 and rows[0]["ok"] is False
+                  and "REFUSED" in rows[0]["why"],
+                  "place refuses a move that would leave a drive under its floor")
+
+            # 14. a harvest shelf on a drive under its floor keeps the item.
+            root = td_p / "low"
+            _mk(root / "sess" / "REPORT.md", b"# keep me\n", 30)
+            rec = sweep(policy=_policy(root, action="quarantine"), dry_run=False,
+                        harvest_to=td_p / "shelf2", seal=False, floors={td: 40.0},
+                        disk_free=lambda _p: 0)
+            check(rec["exit_code"] == 0 and (root / "sess" / "REPORT.md").exists()
+                  and len(rec["harvest_skipped"]) == 1 and rec["items_removed"] == 0,
+                  "shelf drive under its floor: harvest-skipped, item KEPT")
+        finally:
+            cat.close()
