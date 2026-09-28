@@ -74,7 +74,7 @@ from .policy import (
 from .report import rank, summarize
 from .sweep import LIVE_IDS_ENV, SweepConfigError, presets, sweep
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "SCHEMA_VERSION",

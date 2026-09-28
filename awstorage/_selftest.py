@@ -150,6 +150,45 @@ def run() -> int:
         check(got.get("exit_code") == 2 and bool(got.get("could_not_judge")),
               "receipt on could-not-judge: unknown rule -> exit_code 2, receipt written")
 
+        # 7. emergency delete: under the floor a flagged quarantine rule DELETES after a
+        #    verified harvest; an unflagged rule still quarantines; a failed harvest
+        #    (off-drive refusal) deletes nothing.
+        er = td_p / "em"
+        _mk(er / "sess-x" / "R.md", b"# x", 30)
+        _mk(er / "sess-y" / "R.md", b"# y", 30)
+        hot = {"emergency_free_gb": 1, "disk_free": lambda _p: 0}
+        qx = {"action": "quarantine", "emergency_delete": True}
+        rec = sweep(policy=_policy(er, paths=[str(er / "sess-x").replace("\\", "/")], **qx),
+                    dry_run=False, harvest_to=shelf, seal=False, **hot)
+        rec2 = sweep(policy=_policy(er, paths=[str(er / "sess-y").replace("\\", "/")],
+                                    action="quarantine"),
+                     dry_run=False, harvest_to=shelf, seal=False, **hot)
+        qroot = er / ".awstorage-quarantine"
+        check(rec["emergency_deleted"] == 1 and rec["bytes_freed"] > 0
+              and not (er / "sess-x").exists() and rec2["emergency_deleted"] == 0
+              and rec2["bytes_quarantined"] > 0 and qroot.is_dir()
+              and any(qroot.rglob("sess-y")),
+              "emergency delete: flagged rule deletes under the floor; unflagged quarantines")
+        _mk(er / "sess-z" / "R.md", b"# z", 30)
+        rec = sweep(policy=_policy(er, paths=[str(er / "sess-z").replace("\\", "/")], **qx),
+                    dry_run=False, harvest_to=shelf, seal=False, harvest_offdrive=True, **hot)
+        check(rec["emergency_deleted"] == 0 and (er / "sess-z" / "R.md").exists(),
+              "emergency delete: refused when the harvest did not verify (item kept)")
+
+        # 8. measure cap: an item past the cap is judged by its top mtime + a sample --
+        #    all old -> eligible; one fresh sampled file -> live, untouched.
+        cr = td_p / "cap"
+        _mk(cr / "old" / "d" / "a.bin", b"z", 30)
+        _mk(cr / "warm" / "d" / "b.md", b"z", 5)
+        for d in (cr / "old" / "d", cr / "old", cr / "warm" / "d", cr / "warm"):
+            t = time.time() - 30 * 3600
+            os.utime(d, (t, t))
+        rec = sweep(policy=_policy(cr), dry_run=True, harvest_to=shelf, seal=False,
+                    measure_cap_s=0)
+        verdict = {Path(c["path"]).name: c["verdict"] for c in rec["capped"]}
+        check(verdict == {"old": "eligible", "warm": "live"},
+              "measure cap: capped old item eligible, capped item with a fresh file live")
+
     if fails:
         print(f"self-test FAIL: {len(fails)} sweep guard(s) did not fire")
         return 1

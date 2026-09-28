@@ -77,6 +77,13 @@ DEFAULT_HARVEST: dict[str, Any] = {
     "manifest_min_mb": 64,
 }
 DEFAULT_LIVE_WINDOW = "2h"
+DEFAULT_MEASURE_CAP_S = 120.0
+# A capped item is judged by its top entry plus this many files in scandir order.
+SAMPLE_MAX_FILES = 2000
+SAMPLE_MAX_DIRS = 20000
+# Classes whose loss costs a regeneration, never data: the only ones a rule may mark
+# `emergency_delete` (quarantine skipped when the drive is under the floor).
+EMERGENCY_DELETE_CLASSES = frozenset({"build-temp", "package-cache"})
 BINARY_SNIFF_BYTES = 8192
 TOP_SUBDIRS = 20
 MAX_SKIPPED_LISTED = 2000
@@ -219,6 +226,7 @@ def presets() -> dict[str, dict]:
             "purge_after": "24h",
             "harvest": dict(DEFAULT_HARVEST),
             "live_guard": {"window": DEFAULT_LIVE_WINDOW},
+            "emergency_delete": True,
             "why": "per-session agent scratchpads + task outputs; 173 GB unreaped on "
                    "2026-09-27. 12h idle outlives any session we run; harvest keeps the "
                    "reports, the quarantine keeps a day to change your mind",
@@ -233,6 +241,7 @@ def presets() -> dict[str, dict]:
             "purge_after": "3d",
             "harvest": dict(DEFAULT_HARVEST),
             "live_guard": {"window": DEFAULT_LIVE_WINDOW},
+            "emergency_delete": True,
             "why": "installer/extractor leftovers; ~19k stale entries measured 2026-09-27. "
                    "The agent-scratch tree has its own rule and is excluded here",
         },
@@ -280,6 +289,15 @@ def validate_rule(rule: Mapping[str, Any]) -> dict:
     if live is not None and not isinstance(live, Mapping):
         raise SweepConfigError(f"rule {name}: `live_guard` must be a mapping")
     snap = rule.get("snapshot", False)
+    emergency_delete = rule.get("emergency_delete", False)
+    if emergency_delete not in (True, False):
+        raise SweepConfigError(f"rule {name}: `emergency_delete` must be true or false")
+    if emergency_delete and cls not in EMERGENCY_DELETE_CLASSES:
+        raise SweepConfigError(f"rule {name}: emergency_delete is only for regenerable "
+                               f"classes {sorted(EMERGENCY_DELETE_CLASSES)}, not {cls!r}")
+    if emergency_delete and harvest is False:
+        # The deletion is allowed only AFTER a verified harvest; no harvest, no proof.
+        raise SweepConfigError(f"rule {name}: emergency_delete requires harvest")
     if snap not in (True, False) and not isinstance(snap, Mapping):
         raise SweepConfigError(f"rule {name}: `snapshot` must be true/false or a mapping")
     return {
@@ -296,6 +314,7 @@ def validate_rule(rule: Mapping[str, Any]) -> dict:
             "ids": [str(x) for x in (live.get("ids") or [])],
         },
         "snapshot": snap,
+        "emergency_delete": bool(emergency_delete),
         "why": str(rule.get("why", "")),
     }
 
@@ -363,13 +382,16 @@ def _disk_free(p: str) -> int:
 # -- measure -----------------------------------------------------------------------
 
 def measure(path: str, include: list[re.Pattern] | None = None, *,
-            stop_newer_than: float | None = None, deadline: float | None = None) -> dict:
+            stop_newer_than: float | None = None, deadline: float | None = None,
+            cap_deadline: float | None = None) -> dict:
     """Bytes, counts, newest mtime INSIDE the item, largest subdirs, harvest candidates.
 
     `stop_newer_than` (epoch): the walk stops at the first file newer than this and
     sets early="fresh" -- such an item cannot be eligible, and walking the rest of a
     live 100 GB scratch tree to learn that is what made the first real dry run
-    overrun 15 minutes. `deadline` (monotonic): stop and set early="budget".
+    overrun 15 minutes. `deadline` (monotonic): stop and set early="budget" (the
+    PASS is out of time). `cap_deadline` (monotonic): stop and set early="capped"
+    (this ITEM has had its share; the caller judges it by `sample_age`).
 
     Newest mtime covers the FILES below the item, never the item's own
     entry (its mtime says only that a direct child was renamed). A tree with no
@@ -403,6 +425,9 @@ def measure(path: str, include: list[re.Pattern] | None = None, *,
     for d, dirs, files, links in walk_no_follow(p):
         if deadline is not None and time.monotonic() >= deadline:
             out["early"] = "budget"
+            break
+        if cap_deadline is not None and time.monotonic() >= cap_deadline:
+            out["early"] = "capped"
             break
         rel_d = os.path.relpath(d, p).replace("\\", "/")
         rel_d = "" if rel_d == "." else rel_d
@@ -451,6 +476,56 @@ def measure(path: str, include: list[re.Pattern] | None = None, *,
     out["newest_mtime"] = newest or newest_dir or st.st_mtime
     out["top_subdirs"] = [{"path": k, "bytes": v} for k, v in
                           sorted(sub.items(), key=lambda kv: -kv[1])[:TOP_SUBDIRS]]
+    return out
+
+
+def sample_age(path: str, cutoff: float, include: list[re.Pattern] | None = None, *,
+               max_files: int = SAMPLE_MAX_FILES, max_dirs: int = SAMPLE_MAX_DIRS) -> dict:
+    """Bounded age read for an item whose full walk hit the per-item measure cap.
+
+    Reads the item's TOP-LEVEL mtime and the first `max_files` files in scandir
+    order (never following a link). `fresh` names the first entry newer than `cutoff`
+    (epoch), or None when everything sampled is older. Harvest candidates seen on the
+    way are returned too, so a capped item still harvests what the sample reached.
+    Measured 2026-09-28: one 106 GB dead session tree spent the whole 15 min pass
+    being measured and was never acted on.
+    """
+    p = long_path(path)
+    out: dict[str, Any] = {"top_mtime": 0.0, "files": 0, "dirs": 0, "newest_mtime": 0.0,
+                           "fresh": None, "candidates": [], "errors": 0}
+    try:
+        top = os.lstat(p).st_mtime
+    except OSError:
+        out["errors"] = 1
+        out["fresh"] = "(unreadable top entry)"  # cannot prove idle: treat as live
+        return out
+    out["top_mtime"] = out["newest_mtime"] = top
+    if top > cutoff:
+        out["fresh"] = "(top-level entry)"
+        return out
+    for d, dirs, files, _links in walk_no_follow(p):
+        out["dirs"] += 1
+        rel_d = os.path.relpath(d, p).replace("\\", "/")
+        rel_d = "" if rel_d == "." else rel_d
+        for e in files:
+            if out["files"] >= max_files:
+                break
+            try:
+                fst = e.stat(follow_symlinks=False)
+                mt, size = fst.st_mtime, int(fst.st_size)
+            except OSError:
+                out["errors"] += 1
+                continue
+            out["files"] += 1
+            out["newest_mtime"] = max(out["newest_mtime"], mt)
+            rel = f"{rel_d}/{e.name}" if rel_d else e.name
+            if mt > cutoff:
+                out["fresh"] = rel
+                return out
+            if include and any(rx.match(rel) for rx in include):
+                out["candidates"].append((rel, size, e.path, False))
+        if out["files"] >= max_files or out["dirs"] >= max_dirs:
+            break
     return out
 
 
@@ -569,12 +644,13 @@ def harvest_item(item: str, rule: dict, m: dict, shelf: Path, *, write: bool,
         "node": socket.gethostname(),
         "total_bytes": m["bytes"],
         "file_count": m["files"],
+        "measure": "capped (totals are a floor)" if m.get("capped") else "full",
         "top_subdirs": m["top_subdirs"],
         "harvested": res["harvested"],
         "skipped": skipped,
     }
     res["manifest"] = manifest
-    if (not res["harvested"] and not res["withheld"]
+    if (not res["harvested"] and not res["withheld"] and not m.get("capped")
             and m["bytes"] < float(cfg.get("manifest_min_mb", 64)) * 2**20):
         res["dir"] = None  # nothing worth a shelf entry; the ledger/audit keep the record
         return res
@@ -710,6 +786,7 @@ def sweep(
     disk_free: Callable[[str], int] | None = None,
     node: str | None = None,
     time_budget_s: float | None = None,
+    measure_cap_s: float | None = DEFAULT_MEASURE_CAP_S,
     strata_url: str | None = None,
     strata_insecure_http_for_tests: bool = False,
     strata_staging: str | Path | None = None,
@@ -726,6 +803,11 @@ def sweep(
     and dropped once every object is verified remotely.
     `time_budget_s` stops the pass cleanly (receipt `truncated: true`, exit code
     unaffected) so a scheduler's hard timeout never kills it before the receipt lands.
+    `measure_cap_s` bounds ONE item's age walk (None = unbounded): past it the item is
+    judged by its top-level mtime + a bounded file sample (`sample_age`), eligible only
+    when all of it is older than max_idle, and listed in the receipt's `capped`.
+    Under `emergency_free_gb`, a rule with `emergency_delete` DELETES (not quarantines)
+    an eligible item once its harvest is verified; receipt `emergency_deleted`.
     """
     from . import integrations as ig  # lazy: its siblings are all optional
 
@@ -751,6 +833,8 @@ def sweep(
         "tool": "awstorage sweep", "exit_code": 2, "started": _now_iso(), "finished": None,
         "dry_run": bool(dry_run), "rules": [], "items_seen": 0, "items_eligible": 0,
         "items_removed": 0, "bytes_freed": 0, "bytes_quarantined": 0, "bytes_harvested": 0,
+        "bytes_purged": 0, "bytes_emergency_deleted": 0, "emergency_deleted": 0,
+        "capped": [], "measure_cap_s": measure_cap_s,
         "files_harvested": 0, "withheld_secret": 0, "skipped_live": [], "skipped_busy": [],
         "kept_fresh": 0, "errors": [], "could_not_judge": [], "warnings": [], "notes": [],
         "emergency": [], "free_before": {}, "free_after": {}, "items": [], "purged": [],
@@ -775,6 +859,7 @@ def sweep(
              publish_to=publish_to,
              land_to_awm=land_to_awm, awm_db=awm_db, snapshot_store=snapshot_store,
              t_now=t_now, env=env, free_fn=free_fn, ig=ig, time_budget_s=time_budget_s,
+             measure_cap_s=measure_cap_s,
              strata=strata, strata_err=strata_err, receipt=receipt,
              protect=[str(p) for p in (receipt, getattr(cat, "path", None), audit_log,
                                        awm_db, snapshot_store) if p])
@@ -806,7 +891,7 @@ def _run(rec: dict, *, rules, policy, dry_run, shelf: Path, harvest_offdrive,
          emergency_free_gb, cat, live_ids, live_ids_file, audit_log, require_audit,
          seal_key, seal, publish_to, land_to_awm, awm_db, snapshot_store, t_now, env,
          free_fn, ig, protect: list, time_budget_s: float | None, strata, strata_err,
-         receipt=None) -> None:
+         receipt=None, measure_cap_s: float | None = DEFAULT_MEASURE_CAP_S) -> None:
     node = rec["node"]
     # An item the last pass ran out of budget on goes FIRST this time. Measured
     # 2026-09-27: a 25 GB session tree was cut at the 300 s mark; in sorted order it
@@ -863,11 +948,12 @@ def _run(rec: dict, *, rules, policy, dry_run, shelf: Path, harvest_offdrive,
             rec["warnings"].append(f"audit append failed: {r.get('reason')}")
         return bool(r.get("ok"))
 
-    def ledger(path: str, rule: dict, outcome: str, bytes_: int = 0, detail: str = "") -> None:
+    def ledger(path: str, rule: dict, outcome: str, bytes_: int = 0, detail: str = "",
+               action: str | None = None) -> None:
         if cat is None:
             return
         cat.ledger(proposal_id=None, node=node, path=path,
-                   action=f"sweep:{rule['name']}:{rule['action']}", outcome=outcome,
+                   action=f"sweep:{rule['name']}:{action or rule['action']}", outcome=outcome,
                    bytes_=bytes_, detail=detail[:1000] if detail else None)
 
     protect = list(protect) + [str(shelf), os.getcwd(), sys.prefix]
@@ -884,6 +970,13 @@ def _run(rec: dict, *, rules, policy, dry_run, shelf: Path, harvest_offdrive,
             vol_free[k] = int(free_fn(p))
             vol_label.setdefault(k, p)
         return k, vol_free[k]
+
+    def credit(p: str, n: int) -> None:
+        # Bytes this pass freed on p's volume: the emergency floor is re-judged against
+        # them, so a pass stops emergency-deleting once the drive is back above it.
+        k = volume_key(p)
+        if k in vol_free and n > 0:
+            vol_free[k] += int(n)
 
     # Resolve EVERY rule's bases before touching any item: an unreadable root in the
     # second rule must stop the pass before the first rule has removed anything.
@@ -911,11 +1004,17 @@ def _run(rec: dict, *, rules, policy, dry_run, shelf: Path, harvest_offdrive,
                       if rule["harvest"] is not False else None)
         live_rule = rule["live_guard"]
         rule_live = live | {i.lower() for i in (live_rule or {}).get("ids", [])}
-        bases: list[str] = []
-        for exp, base in pats:
-            bases.append(base)
+        bases = [base for _exp, base in pats]
+        for base in bases:
             k, f = free_of(base)
             rec["free_before"].setdefault(k, f)
+        # PURGE FIRST, on every pass: expired quarantine is the cheapest space there
+        # is, and a pass the time budget cuts (the 106 GB tree, 2026-09-28) must not
+        # also skip the one step that actually frees bytes.
+        _purge(rec, rule, bases, dry_run=dry_run, t_now=t_now, free_of=free_of,
+               emergency_free_gb=emergency_free_gb, audit=audit, ledger=ledger,
+               credit=credit)
+        for exp, base in pats:
             found = sorted(glob.glob(exp))
             found.sort(key=lambda x: os.path.normcase(x.replace("\\", "/")) not in resume)
             for raw in found:
@@ -938,13 +1037,20 @@ def _run(rec: dict, *, rules, policy, dry_run, shelf: Path, harvest_offdrive,
                           audit=audit, ledger=ledger, ig=ig, seal_key=seal_key, seal=seal,
                           land_to_awm=land_to_awm, awm_db=awm_db,
                           snapshot_store=snapshot_store, touched_days=touched_days,
-                          deadline=deadline, strata=strata)
+                          deadline=deadline, strata=strata, measure_cap_s=measure_cap_s,
+                          credit=credit)
         if rec["truncated"]:
             rec["notes"].append(f"time budget of {human_duration(time_budget_s or 0)} "
-                                "reached; remaining items and purges wait for the next pass")
+                                "reached; remaining items and later rules wait for the "
+                                "next pass")
             break
-        _purge(rec, rule, bases, dry_run=dry_run, t_now=t_now, free_of=free_of,
-               emergency_free_gb=emergency_free_gb, audit=audit, ledger=ledger)
+
+    if not dry_run and rec["bytes_freed"] == 0 and rec["bytes_quarantined"] > 0:
+        # Say WHY a pass that removed things freed nothing (the first real run did).
+        rec["notes"].append(
+            f"bytes_freed is 0: {rec['bytes_quarantined']} bytes were QUARANTINED on the "
+            "same drive and return only at each rule's purge_after; under "
+            "--emergency-free-gb, rules with emergency_delete delete instead")
 
     for k in vol_free:
         try:
@@ -965,7 +1071,8 @@ def _one_item(rec: dict, *, item: str, base: str, rule: dict, include_rx, exclud
               rule_live: set, live_rule, dry_run: bool, shelf: Path, harvest_offdrive: bool,
               emergency_free_gb, t_now: float, seq: int, protect: list, free_of,
               emergency_vols: dict, audit, ledger, ig, seal_key, seal, land_to_awm, awm_db,
-              snapshot_store, touched_days: set, deadline: float | None, strata=None
+              snapshot_store, touched_days: set, deadline: float | None, strata=None,
+              measure_cap_s: float | None = DEFAULT_MEASURE_CAP_S, credit=None
               ) -> None:
     rec["items_seen"] += 1
     name = os.path.basename(item.rstrip("/"))
@@ -992,9 +1099,11 @@ def _one_item(rec: dict, *, item: str, base: str, rule: dict, include_rx, exclud
         return keep("skipped-live", "registered live id")
 
     max_idle = rule["max_idle"]
+    hot = False
     if emergency_free_gb is not None:
         vk, free = free_of(item)
         if free < float(emergency_free_gb) * 2**30:
+            hot = True
             max_idle = max_idle / 2.0
             if (vk, rule["name"]) not in emergency_vols:
                 emergency_vols[(vk, rule["name"])] = True
@@ -1006,9 +1115,12 @@ def _one_item(rec: dict, *, item: str, base: str, rule: dict, include_rx, exclud
                                          "rule": rule["name"], "max_idle_s": max_idle,
                                          "message": msg})
     window = live_rule["window"] if live_rule else 0.0
+    cutoff = t_now - max(max_idle, window)
+    cap_deadline = (time.monotonic() + max(0.0, float(measure_cap_s))
+                    if measure_cap_s is not None else None)
     # Stop walking at the first file too new to be eligible (or to be judged live).
-    m = measure(item, include_rx, stop_newer_than=t_now - max(max_idle, window),
-                deadline=deadline)
+    m = measure(item, include_rx, stop_newer_than=cutoff, deadline=deadline,
+                cap_deadline=cap_deadline)
     row.update(bytes=m["bytes"], files=m["files"], kind=m["kind"],
                age_h=round((t_now - m["newest_mtime"]) / 3600.0, 2))
     if m.get("early") == "budget":
@@ -1019,7 +1131,35 @@ def _one_item(rec: dict, *, item: str, base: str, rule: dict, include_rx, exclud
         row["partial"] = True  # bytes/files counted only up to the fresh file
     if m["kind"] in ("missing", "special"):
         return keep("skipped", f"{m['kind']} entry", listed=False)
+    capped = m.get("early") == "capped"
+    if capped:
+        # The walk saw nothing fresh before the cap (a fresh file ends it as "fresh"),
+        # but it did not see everything: judge by the top entry + a bounded sample,
+        # and never on a read that saw a fresh file.
+        smp = sample_age(item, cutoff, include_rx)
+        cap_row = {"path": item, "rule": rule["name"], "bytes_seen": m["bytes"],
+                   "files_seen": m["files"], "sample_files": smp["files"],
+                   "cap_s": measure_cap_s}
+        rec["capped"].append(cap_row)
+        if smp["fresh"]:
+            cap_row["verdict"] = "live"
+            rec["skipped_live"].append(item)
+            why = (f"measure capped at {float(measure_cap_s or 0):g}s; sampled "
+                   f"{smp['fresh']} is newer than the idle cutoff")
+            audit("skipped-live", path=item, rule=rule["name"], why=why)
+            ledger(item, rule, "skipped-live", detail=why)
+            return keep("skipped-live", why)
+        cap_row["verdict"] = "eligible"
+        seen = {c[0] for c in m["candidates"]}
+        m["candidates"].extend(c for c in smp["candidates"] if c[0] not in seen)
+        m["capped"] = True
+        m["newest_mtime"] = max(m["newest_mtime"] if m["files"] else 0.0,
+                                smp["newest_mtime"])
+        row.update(capped=True, size="unknown (capped)",
+                   age_h=round((t_now - m["newest_mtime"]) / 3600.0, 2))
     idle = t_now - m["newest_mtime"]
+    if capped:
+        idle = max(idle, max_idle, window)  # judged idle by the sample above
     if live_rule and idle < window:
         rec["skipped_live"].append(item)
         why = (f"changed {human_duration(max(idle, 0))} ago (< live window "
@@ -1046,10 +1186,17 @@ def _one_item(rec: dict, *, item: str, base: str, rule: dict, include_rx, exclud
         if s["reason"] == "withheld: secret-pattern":
             audit("withheld-secret", path=item, file=s["path"], rule=rule["name"])
     rec["withheld_secret"] += h["withheld"]
+    # EMERGENCY DELETE: the drive is under the floor, the rule's class is regenerable
+    # scratch and says so, and (checked again at the act) the harvest was VERIFIED.
+    emergency_del = bool(hot and rule["action"] == "quarantine"
+                         and rule.get("emergency_delete") and rule["harvest"] is not False)
+    act = "deleted-emergency" if emergency_del else rule["action"]
+    if emergency_del:
+        row["action"] = act
     if dry_run:
-        ledger(item, rule, "dry-run", m["bytes"], f"would {rule['action']}")
+        ledger(item, rule, "dry-run", m["bytes"], f"would {act}", action=act)
         return keep("dry-run", f"would harvest {len(h['harvested'])} file(s), then "
-                               f"{rule['action']}")
+                               f"{act}")
 
     rec["bytes_harvested"] += h["bytes"]
     rec["files_harvested"] += len(h["harvested"])
@@ -1108,13 +1255,36 @@ def _one_item(rec: dict, *, item: str, base: str, rule: dict, include_rx, exclud
 
     # Record the decision BEFORE acting: a removal with no audit record is the exact
     # failure awdit exists for, so under --require-audit a failed append stops it.
-    event = "deleted" if rule["action"] == "delete" else "quarantined"
+    # The harvest reached here only through `h["ok"]` (verified: size + sha256 of every
+    # copy, manifest read back); a write=False plan never gets this far.
+    harvest_verified = bool(h["ok"]) and not dry_run
+    if emergency_del and not harvest_verified:  # pragma: no cover -- belt and braces
+        emergency_del, act = False, rule["action"]
+    event = ("deleted-emergency" if emergency_del
+             else "deleted" if rule["action"] == "delete" else "quarantined")
     if not audit(f"{event}-begin", path=item, rule=rule["name"], bytes=m["bytes"]):
-        ledger(item, rule, "refused", detail="audit append failed under --require-audit")
+        ledger(item, rule, "refused", detail="audit append failed under --require-audit",
+               action=act)
         return keep("failed", "audit append failed under --require-audit; item kept",
                     error=True)
     try:
-        if rule["action"] == "delete":
+        if emergency_del:
+            removed, errs = remove_tree(item)
+            rec["bytes_freed"] += removed
+            rec["bytes_emergency_deleted"] += removed
+            if credit:
+                credit(item, removed)
+            if errs:
+                audit("failed", path=item, rule=rule["name"], stage=act, why=errs[0])
+                ledger(item, rule, "failed", removed, f"{len(errs)} error(s): {errs[0]}",
+                       action=act)
+                return keep("failed", f"emergency delete incomplete: {len(errs)} "
+                                      f"error(s), first {errs[0]}", error=True)
+            rec["emergency_deleted"] += 1
+            detail = (f"deleted {removed} bytes (emergency: drive under "
+                      f"{float(emergency_free_gb):g} GB; harvest verified at {h['dir']})")
+            row["bytes_freed"] = removed
+        elif rule["action"] == "delete":
             removed, errs = remove_tree(item)
             if errs:
                 audit("failed", path=item, rule=rule["name"], stage="delete", why=errs[0])
@@ -1123,6 +1293,8 @@ def _one_item(rec: dict, *, item: str, base: str, rule: dict, include_rx, exclud
                 return keep("failed", f"delete incomplete: {len(errs)} error(s), first "
                                       f"{errs[0]}", error=True)
             rec["bytes_freed"] += removed
+            if credit:
+                credit(item, removed)
             detail = f"deleted {removed} bytes"
         else:
             qdir, _dest = _quarantine_item(item, base, rule["name"], seq)
@@ -1140,7 +1312,7 @@ def _one_item(rec: dict, *, item: str, base: str, rule: dict, include_rx, exclud
         return keep("failed", f"{rule['action']}: {type(exc).__name__}: {exc}", error=True)
     rec["items_removed"] += 1
     audit(event, path=item, rule=rule["name"], bytes=m["bytes"], detail=detail)
-    ledger(item, rule, "applied", m["bytes"], detail)
+    ledger(item, rule, "applied", m["bytes"], detail, action=act)
     keep("applied", detail)
 
 
@@ -1161,7 +1333,7 @@ def _ship_to_strata(strata, item_dir: Path, node: str, rule_name: str) -> int:
 
 
 def _purge(rec: dict, rule: dict, bases: list[str], *, dry_run: bool, t_now: float,
-           free_of, emergency_free_gb, audit, ledger) -> None:
+           free_of, emergency_free_gb, audit, ledger, credit=None) -> None:
     """Reclaim this rule's quarantine entries older than `purge_after`."""
     if rule["purge_after"] is None:
         return
@@ -1190,6 +1362,9 @@ def _purge(rec: dict, rule: dict, bases: list[str], *, dry_run: bool, t_now: flo
                 continue
             removed, errs = remove_tree(entry)
             rec["bytes_freed"] += removed
+            rec["bytes_purged"] += removed
+            if credit:
+                credit(base, removed)
             row.update(outcome="purged" if not errs else "failed", bytes=removed)
             rec["purged"].append(row)
             ledger(entry, rule, "purged" if not errs else "failed", removed,
@@ -1211,6 +1386,7 @@ __all__ = [
     "parse_duration",
     "presets",
     "resolve_rules",
+    "sample_age",
     "static_base",
     "sweep",
     "validate_rule",

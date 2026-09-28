@@ -124,6 +124,17 @@ One pass: **expand rules -> measure -> guard -> harvest -> remove -> ledger -> r
   `action: delete` deletes outright -- only with `--yes`, like everything else.
 - **Emergency.** `--emergency-free-gb N`: when an item's drive has less than N GB free,
   that rule's `max_idle` (and `purge_after`) halve for the pass; harvest still runs first.
+  A rule with `emergency_delete: true` (the two presets; regenerable classes only)
+  DELETES instead of quarantining there -- only after the item's harvest verified --
+  because a same-drive quarantine frees nothing until `purge_after` (the first real run
+  removed 1130 items and freed 0 bytes). Receipt: `emergency_deleted`,
+  `bytes_emergency_deleted`; audit/ledger action `deleted-emergency`.
+- **Purge every pass.** Each rule purges its expired quarantine BEFORE its items, so a
+  pass the time budget cuts still frees bytes (`bytes_purged`, counted in `bytes_freed`).
+- **Per-item measure cap.** `--measure-cap-s` (default 120): an item whose age walk runs
+  past it is judged by its top-level mtime + its first 2000 files; all old -> eligible
+  (size `unknown (capped)`, listed in the receipt's `capped`), any fresh -> live, skipped.
+  One 106 GB dead session otherwise eats a whole pass just being measured.
 - **Bounded.** `--time-budget SECONDS` (default 3000, inside awrise's 3600 s timeout)
   stops the pass cleanly and marks the receipt `truncated`; a fresh item's walk stops
   at its first too-new file instead of measuring 100 GB it will not touch. The next
@@ -195,7 +206,7 @@ receipt rather than pretending.
 - **awgraph** -- `awstorage graph` emits nodes and typed edges (`contains`,
   `duplicate_of`) any graph store can ingest.
 
-`awstorage --self-test` (or `python -m awstorage --self-test`) proves the refusals still refuse, the quarantine still reverts, and each sweep guard is seen firing: harvest-before-delete, secret withheld, live guard, junction not followed, emergency halving, receipt on failure.
+`awstorage --self-test` (or `python -m awstorage --self-test`) proves the refusals still refuse, the quarantine still reverts, and each sweep guard is seen firing: harvest-before-delete, secret withheld, live guard, junction not followed, emergency halving, emergency delete (only for a flagged rule, never without a verified harvest), the per-item measure cap both ways, receipt on failure.
 
 Apache-2.0.
 

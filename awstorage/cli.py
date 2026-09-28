@@ -13,7 +13,8 @@
     awstorage node-run --node ID --root ROOT [--root ROOT ...] [--gateway URL] [--once]
     awstorage hash <path...>
     awstorage sweep --rules agent-scratch,temp-toplevel [--policy F] [--yes]
-                    [--harvest-to D] [--emergency-free-gb N] [--receipt PATH] [--json]
+                    [--harvest-to D] [--emergency-free-gb N] [--measure-cap-s S]
+                    [--receipt PATH] [--json]
     awstorage audit verify [--audit-log PATH]
     awstorage harvest verify <shelf> | harvest publish <day-dir> --to <target>
     awstorage --self-test            (also: python -m awstorage --self-test)
@@ -351,6 +352,7 @@ def _cmd_sweep(a) -> int:
         publish_to=a.publish_to,
         land_to_awm=a.land_to_awm, awm_db=a.awm_db, snapshot_store=a.snapshot_store,
         time_budget_s=a.time_budget or None,
+        measure_cap_s=None if a.measure_cap_s < 0 else a.measure_cap_s,
     )
     if a.json:
         print(json.dumps(rec, indent=1, sort_keys=True, default=str))
@@ -371,7 +373,8 @@ def _cmd_sweep(a) -> int:
             extra = f"  harvest {hv.get('files', 0)} file(s)/{human(hv.get('bytes', 0))}"
             if hv.get("withheld"):
                 extra += f", withheld {hv['withheld']}"
-        print(f"  {it['outcome']:<12} {human(it.get('bytes', 0)):>10}  "
+        size = "capped" if it.get("capped") else human(it.get("bytes", 0))
+        print(f"  {it['outcome']:<12} {size:>10}  "
               f"{it.get('age_h', 0):>7.1f}h  {it['path']}{extra}  -- {it['reason']}")
     for q in rec["purged"]:
         print(f"  {'purge ' + q['outcome']:<12} {human(q['bytes']):>10}  {q['entry']}")
@@ -380,6 +383,13 @@ def _cmd_sweep(a) -> int:
           f"{rec['files_harvested']} file(s) / {human(rec['bytes_harvested'])}"
           + (f", withheld {rec['withheld_secret']} (secret pattern)"
              if rec["withheld_secret"] else ""))
+    if rec.get("emergency_deleted") or rec.get("bytes_purged"):
+        print(f"  freed by: purge {human(rec.get('bytes_purged', 0))}, emergency delete "
+              f"{rec.get('emergency_deleted', 0)} item(s) / "
+              f"{human(rec.get('bytes_emergency_deleted', 0))}")
+    for c in rec.get("capped", []):
+        print(f"  capped measure ({c['verdict']}): {c['path']} -- saw {c['files_seen']} "
+              f"file(s)/{human(c['bytes_seen'])} + {c['sample_files']} sampled")
     for k, v in rec["free_before"].items():
         after = rec["free_after"].get(k)
         print(f"  free {k}: {human(v)} -> {human(after) if after is not None else '?'}")
@@ -634,7 +644,12 @@ def main(argv: list[str] | None = None) -> int:
     sw.add_argument("--harvest-offdrive", action="store_true",
                     help="refuse a shelf on the same drive as the item")
     sw.add_argument("--emergency-free-gb", type=float,
-                    help="below this free space on an item's drive, max_idle is halved")
+                    help="below this free space on an item's drive, max_idle is halved and"
+                         " rules with emergency_delete DELETE (after a verified harvest)"
+                         " instead of quarantining")
+    sw.add_argument("--measure-cap-s", type=float, default=120.0, metavar="SECONDS",
+                    help="per-item age-walk cap (default 120); past it the item is judged"
+                         " by its top mtime + a 2000-file sample; negative = no cap")
     sw.add_argument("--receipt", help="write the receipt JSON here (on every exit path)")
     sw.add_argument("--time-budget", type=float, default=3000.0, metavar="SECONDS",
                     help="stop cleanly after this long, receipt marked truncated (default"

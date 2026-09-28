@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.1 -- 2026-09-28
+
+The first real unattended run (2026-09-28) exited 0, saw 8541 items, removed 1130 and
+harvested 106 MB -- and freed **0 bytes**: every removal was a quarantine onto the same
+drive, back only after `purge_after` (24 h). The same day C: had hit 100% and corrupted a
+WSL root fs. And one 106 GB dead session tree spent the whole 15 min budget being
+measured, so it was never acted on.
+
+### Added
+- **Emergency delete.** A rule key `emergency_delete` (default `true` for the
+  `agent-scratch` and `temp-toplevel` presets, `false` otherwise; allowed only for the
+  regenerable classes `build-temp` / `package-cache`, and only with harvest on). Under
+  `--emergency-free-gb N`, when the item's drive has < N GB free, an eligible item of
+  such a quarantine rule is DELETED instead of quarantined -- only after its harvest
+  verified (size + sha256 of every copy). Audited/ledgered as `deleted-emergency`. Freed
+  bytes are credited back to the drive, so the pass stops emergency-deleting once the
+  drive is above the floor again.
+- Receipt: `emergency_deleted`, `bytes_emergency_deleted`, `bytes_purged`, and a note
+  explaining a `bytes_freed` of 0 when everything was quarantined.
+- **Per-item measure cap** `--measure-cap-s` (default 120; `measure_cap_s=` in the API,
+  None = unbounded). Past it the item is judged by its top-level mtime plus a bounded
+  sample (first 2000 files in scandir order, `sweep.sample_age`): all older than the idle
+  cutoff -> eligible with size `unknown (capped)`; any fresh -> live, skipped. A walk that
+  saw a fresh file is never capped into eligibility. Harvest still runs (candidates from
+  the walk + sample); the manifest says `measure: capped`. Receipt `capped` lists each.
+- Self-test: emergency delete fires only for a flagged rule under the floor and never
+  without a verified harvest; the measure cap judges both ways.
+
+### Changed
+- **Purge runs first in every rule's pass**, before its items: a pass the time budget
+  cuts no longer skips the only step that frees quarantined bytes.
+
 ## 0.2.0 -- 2026-09-27
 
 The unattended half. On 2026-09-27 drive C: reached 122 MB free and corrupted a WSL
