@@ -30,7 +30,12 @@ from typing import Callable, Optional
 from ._fs import contains_link, fingerprint, is_link, remove_tree, walk_no_follow
 
 NEVER_AUTO = frozenset({"service-state", "dataset", "vm-disk", "backup", "unknown"})
-ACTIONS = ("delete", "compress", "backup-then-delete", "review", "prune-engine")
+#: Actions that run ONLY with a human decision card approving the exact proposal.
+#: They share the one closed vocabulary below; `node_run.DISPATCH` routes them to
+#: `awstorage.manage.apply_manage` with that card, never to `apply()` here.
+CARD_ACTIONS = ("hardlink", "quarantine-copy", "archive", "share")
+#: The ONE closed action vocabulary. `apply()` and `node_run` both dispatch on it.
+ACTIONS = ("delete", "compress", "backup-then-delete", "review", "prune-engine") + CARD_ACTIONS
 
 
 class ApplyRefusedError(Exception):
@@ -279,6 +284,9 @@ def apply(
 
     if p.action not in ACTIONS:
         refuse(f"unknown action {p.action!r}")
+    if p.action in CARD_ACTIONS:
+        refuse(f"{p.action!r} is card-only: it runs through awstorage.manage.apply_manage with "
+               "the decision card approving this proposal, never through policy.apply")
     if not _under_roots(p.path, root_paths):
         refuse(f"{p.path} is outside the declared roots {[str(r) for r in root_paths]}")
     if p.cls in NEVER_AUTO and approved is not True and p.status != "approved":

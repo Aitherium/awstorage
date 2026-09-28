@@ -208,3 +208,159 @@ def test_run_loop_not_once_stops_after_one_pass_when_told(tree: Path, monkeypatc
     monkeypatch.setattr(time, "sleep", lambda _s: pytest.fail("run_loop slept with once=True"))
     rc = run_loop(once=True, node_id="test-node", roots=[tree], interval_s=9999)
     assert rc == 0
+
+
+# ------------------------------------------------------------ card orders (A7)
+
+def _manage_world(tmp_path: Path, *, card_over: dict | None = None):
+    import hashlib
+    import os
+
+    from awstorage import manage
+    from awstorage.catalog import Catalog
+
+    root = tmp_path / "vol"
+    data = b"dupe" * 300
+    paths = []
+    for rel in ("k/f.bin", "copy/f.bin"):
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        paths.append(p)
+    sha = hashlib.sha256(data).hexdigest()
+    rows = []
+    for p in paths:
+        st = os.stat(p)
+        rows.append({"node": "test-node", "path": str(p), "bytes": st.st_size,
+                     "mtime_ns": st.st_mtime_ns, "sha256": sha, "dev": st.st_dev,
+                     "ino": st.st_ino, "nlink": 1})
+    [prop] = manage.propose_dupes([{"sha256": sha, "bytes": len(data), "paths": rows}],
+                                  node="test-node")
+    prop.id, prop.status, prop.card_id = 41, "approved", "d-41"
+    card = {"id": "d-41", "status": "answered", "answer": "approve",
+            "answered_via": "popup", "answered_by": "owner@test",
+            "facts": manage.card_facts(41), **(card_over or {})}
+    order_row = {"id": 41, "node": "test-node", "path": prop.path, "action": "quarantine-copy",
+                 "bytes": prop.bytes, "cls": "dedup", "status": "approved"}
+    local = Catalog(tmp_path / "node-manage.db")
+    return root, paths, prop, card, order_row, local
+
+
+class _ManageClient(_FakeClient):
+    def __init__(self, orders, order_body):
+        super().__init__(orders=orders)
+        self._order_body = order_body
+
+    def call_tool(self, name, args):
+        if name == "storage_manage_order":
+            self.calls.append((name, args))
+            return self._order_body
+        if name == "storage_manage_report":
+            self.calls.append((name, args))
+            return {"updated": len(json.loads(args["rows_json"]))}
+        return super().call_tool(name, args)
+
+
+def test_dispatch_covers_the_one_vocabulary():
+    from awstorage.node_run import DISPATCH, _card_order, _policy_order
+    from awstorage.policy import ACTIONS, CARD_ACTIONS
+
+    assert set(DISPATCH) == set(ACTIONS)
+    assert all(DISPATCH[a] is _card_order for a in CARD_ACTIONS)
+    assert all(DISPATCH[a] is _policy_order for a in set(ACTIONS) - set(CARD_ACTIONS))
+
+
+@pytest.fixture
+def attested(monkeypatch):
+    """The decisions store AFTER it attests the answerer (owner@test)."""
+    from awstorage import manage
+
+    monkeypatch.setattr(manage, "STORE_ATTESTS_ANSWERER", True)
+    monkeypatch.setenv(manage.OWNERS_ENV, "owner@test")
+
+
+def test_card_order_refused_while_the_store_does_not_attest_the_answerer(tmp_path: Path):
+    from awstorage.node_run import ManageContext
+
+    root, paths, prop, card, order_row, local = _manage_world(tmp_path)
+    try:
+        ctx = ManageContext(fetch_order=lambda pid: {"order": prop.to_dict(), "card": card},
+                            catalog=local)
+        [row] = apply_orders([order_row], roots=[root], manage=ctx)
+        assert row["outcome"] == "refused" and "attest" in row["detail"]
+        assert all(p.exists() for p in paths)
+    finally:
+        local.close()
+
+
+def test_card_order_routes_to_apply_manage_with_its_card_and_runs_once(tmp_path: Path,
+                                                                       attested):
+    from awstorage.node_run import ManageContext
+    from awstorage.remote import fetch_manage_order
+
+    root, paths, prop, card, order_row, local = _manage_world(tmp_path)
+    client = _ManageClient([order_row], {"order": prop.to_dict(), "card": card})
+    ctx = ManageContext(fetch_order=lambda pid: fetch_manage_order(client, "test-node", pid),
+                        catalog=local)
+    try:
+        summary = run_once(client, node_id="test-node", roots=[root], manage=ctx)
+        assert [r["outcome"] for r in summary["applied"]] == ["applied"]
+        assert paths[0].exists() and not paths[1].exists()
+        reported = json.loads([c for c in client.calls
+                               if c[0] == "storage_report_apply"][0][1]["rows_json"])
+        assert {r["outcome"] for r in reported} == {"applied", "quarantined"}
+        assert any(c[0] == "storage_manage_report" for c in client.calls)
+        # a second pass never re-executes the same order
+        again = apply_orders([order_row], roots=[root], manage=ctx)
+        assert again[0]["outcome"] == "already-executed"
+        assert sum(1 for c in client.calls if c[0] == "storage_manage_order") == 1
+    finally:
+        local.close()
+
+
+@pytest.mark.parametrize("over", [{"answered_via": "agent"}, {"answered_via": "api"},
+                                  {"answered_by": None}, {"id": "d-other"},
+                                  {"facts": ["proposal_id: 7"]}, {"answer": "reject"}])
+def test_card_order_with_a_forged_card_is_refused(tmp_path: Path, over, attested):
+    from awstorage.node_run import ManageContext
+
+    root, paths, prop, card, order_row, local = _manage_world(tmp_path, card_over=over)
+    try:
+        ctx = ManageContext(fetch_order=lambda pid: {"order": prop.to_dict(), "card": card},
+                            catalog=local)
+        [row] = apply_orders([order_row], roots=[root], manage=ctx)
+        assert row["outcome"] == "refused"
+        assert all(p.exists() for p in paths)
+    finally:
+        local.close()
+
+
+def test_card_order_without_manage_context_is_refused_never_policy_applied(tmp_path: Path):
+    root, paths, prop, card, order_row, local = _manage_world(tmp_path)
+    local.close()
+    [row] = apply_orders([order_row], roots=[root])
+    assert row["outcome"] == "refused" and "card-only" in row["detail"]
+    assert all(p.exists() for p in paths)
+
+
+def test_every_exception_is_a_ledger_row(tmp_path: Path):
+    from awstorage.node_run import ManageContext
+
+    root, paths, prop, card, order_row, local = _manage_world(tmp_path)
+
+    def boom(pid):
+        raise RuntimeError("genesis exploded")
+
+    try:
+        [row] = apply_orders([order_row], roots=[root],
+                             manage=ManageContext(fetch_order=boom, catalog=local))
+        assert row["outcome"] == "failed" and "genesis exploded" in row["detail"]
+    finally:
+        local.close()
+
+
+def test_legacy_dotted_order_is_dispatched_as_card_only(tmp_path: Path):
+    root, paths, prop, card, order_row, local = _manage_world(tmp_path)
+    local.close()
+    [row] = apply_orders([{**order_row, "action": "dedup.quarantine_copies"}], roots=[root])
+    assert row["outcome"] == "refused" and row["action"] == "quarantine-copy"

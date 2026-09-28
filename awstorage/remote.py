@@ -374,3 +374,38 @@ def report_apply(client: GatewayClient, node_id: str, rows: list[dict]) -> dict:
     if isinstance(result, dict) and "written" not in result and result.get("detail"):
         raise GatewayError(f"report_apply for {node_id} refused: {result['detail']}")
     return result if isinstance(result, dict) else {"raw": result}
+
+
+def fetch_manage_order(client: GatewayClient, node_id: str, proposal_id: int) -> dict:
+    """One card order with its approving decision record, read by Genesis from the
+    decision plane: ``{"order": {...}, "card": {...}}``. The node re-verifies the
+    card itself (`awstorage.manage.verify_card`); Genesis is not trusted alone.
+
+    Rides the gateway tool `storage_manage_order` (Genesis GET
+    /api/v1/storage/manage/orders/{node}/{proposal_id})."""
+    result = client.call_tool("storage_manage_order",
+                              {"node_id": node_id, "proposal_id": int(proposal_id)})
+    if isinstance(result, dict) and (result.get("error") or
+                                     ("order" not in result and result.get("detail"))):
+        raise GatewayError(f"manage order {proposal_id} for {node_id} refused: "
+                           f"{result.get('error') or result.get('detail')}")
+    if not isinstance(result, dict):
+        raise GatewayError(f"manage order {proposal_id}: unexpected {type(result).__name__}")
+    return result
+
+
+def report_manage(client: GatewayClient, node_id: str, rows: list[dict]) -> dict:
+    """Move card orders out of `approved` in Genesis (applied/drifted/refused/failed)
+    so a refused order leaves the queue. Evidence, not authority: Genesis only moves
+    an `approved`/`executing` proposal of THIS node forward, never approves one.
+
+    Rides the gateway tool `storage_manage_report` (Genesis POST
+    /api/v1/storage/manage/report/{node})."""
+    result = client.call_tool("storage_manage_report", {
+        "node_id": node_id, "rows_json": json.dumps(rows, separators=(",", ":"), default=str),
+    })
+    if isinstance(result, dict) and (result.get("error") or
+                                     ("updated" not in result and result.get("detail"))):
+        raise GatewayError(f"report_manage for {node_id} refused: "
+                           f"{result.get('error') or result.get('detail')}")
+    return result if isinstance(result, dict) else {"raw": result}
