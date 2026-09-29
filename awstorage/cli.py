@@ -27,6 +27,9 @@
                     [--receipt PATH] [--json]
     awstorage audit verify [--audit-log PATH]
     awstorage harvest verify <shelf> | harvest publish <day-dir> --to <target>
+    awstorage relocate plan --source <dir> [--source ...] --dest-drive <X:> [--json]
+    awstorage relocate show <plan_id> | approve <plan_id> --i-am-the-owner
+    awstorage relocate apply <plan_id> | apply-approved | status [--json]
     awstorage suggest PATH --reason R --by AGENT [--action A] [--evidence JSON]
     awstorage suggestions [--status S] | suggestion approve|reject|revert ID [--card F]
     awstorage apply-suggestions [--yes] | trust
@@ -642,9 +645,9 @@ def _run_manage(rest: list[str]) -> int:
     argparse (a REMAINDER after a subparser drops a leading `--flag`)."""
     try:
         from .manage import main as manage_main  # noqa: PLC0415
-    except ImportError:
+    except ImportError as exc:
         print("awstorage manage: this awstorage has no manage plane (awstorage.manage);"
-              " upgrade the package", file=sys.stderr)
+              f" upgrade the package ({exc})", file=sys.stderr)
         return 2
     if rest[:1] == ["--"]:
         rest = rest[1:]
@@ -858,6 +861,164 @@ def _cmd_harvest(a) -> int:
     if not r["available"]:
         return 2
     return 0 if r["ok"] else 1
+
+
+def _print_plan(plan: dict) -> None:
+    print(f"plan {plan['plan_id']} ({plan['created_at']}): "
+          + ("OK -- approvable" if plan["ok"] else "REFUSED -- cannot be approved"))
+    for m in plan["moves"]:
+        ev = m["evidence"]
+        print(f"  {m['id']} {m['source']} -> {m['dest']}  {human(m['bytes'])} in"
+              f" {m['files']} files, cold {ev['cold_days']}d, handles"
+              f" {ev['open_handles'] if ev['open_handles'] is not None else '?'}, mounted"
+              f" {ev['container_mounted'] if ev['container_mounted'] is not None else '?'},"
+              f" link {m['link']}")
+    for d, p in plan["projection"].items():
+        print(f"  {d} free {p['free_before_gb']} -> {p['free_after_gb']} GB"
+              f" (floor {p['floor_gb']:g})  {'ok' if p['ok'] else 'BELOW FLOOR'}")
+    for r in plan["refusals"]:
+        print(f"  REFUSED {r}")
+
+
+def _print_result(r: dict) -> None:
+    print(f"{r['plan_id']}: {r['outcome']}" + (f" -- {r['reason']}" if r.get("reason") else "")
+          + (f" ({r['note']})" if r.get("note") else ""))
+    for m in r.get("moves") or []:
+        bad = [n["channel"] for n in m.get("notifications") or [] if not n.get("ok")]
+        print(f"  {m['id']} {m['outcome']}: {m['source']} -> {m['dest']}"
+              f" ({human(m.get('bytes') or 0)})"
+              + (f" -- {m['reason']}" if m.get("reason") else "")
+              + (f"  [not posted: {', '.join(bad)}]" if bad else "")
+              + (f"  [ledger: {m['ledger_error']}]" if m.get("ledger_error") else ""))
+
+
+def _read_mounts(path: str | None) -> list[str] | None:
+    """--mounts-file: a JSON list of host paths, or one per line."""
+    if not path:
+        return None
+    text = Path(path).read_text(encoding="utf-8")
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return [str(x) for x in data]
+
+
+def _cmd_relocate(a) -> int:
+    from . import relocate as rl
+
+    try:
+        if a.relocate_cmd == "plan":
+            topo, floors, where = rl.load_relocate_topology(a.topology)
+            plan = rl.plan_relocation(
+                a.source, a.dest_drive, floors, rl.default_free_space,
+                dest_root=a.dest_root, topology=topo, mounts=_read_mounts(a.mounts_file),
+                handles_fn=None if a.no_handle_probe else rl.open_handles,
+                cold_min_days=a.cold_days, link="none" if a.no_link else "junction")
+            path = rl.save_plan(plan)
+            if a.json:
+                print(json.dumps(plan, indent=1))
+            else:
+                _print_plan(plan)
+                print(f"  floors: {where}\n  plan -> {path}")
+            return 0 if plan["ok"] else 1
+        if a.relocate_cmd == "show":
+            plan = rl.load_plan(a.plan_id)
+            if a.json:
+                print(json.dumps(plan, indent=1))
+            else:
+                _print_plan(plan)
+                appr = rl.load_approval(a.plan_id)
+                res = rl.load_result(a.plan_id)
+                by = f"{appr['approved_by']} via {appr['via']}" if appr else "no"
+                print(f"  approved: {by}   result: {res['outcome'] if res else 'none'}")
+            return 0
+        if a.relocate_cmd == "approve":
+            if not a.i_am_the_owner:
+                print("awstorage relocate approve: refused -- pass --i-am-the-owner (only the"
+                      " owner approves from a shell; everyone else answers the decision"
+                      " card)", file=sys.stderr)
+                return 1
+            who = os.environ.get("USERNAME") or os.environ.get("USER") or "owner"
+            rec = rl.approve_plan(a.plan_id, approved_by=who, via="cli --i-am-the-owner",
+                                  note=a.note)
+            print(f"approved {a.plan_id} as {rec['approved_by']} (digest"
+                  f" {rec['plan_sha256'][:12]})")
+            return 0
+        if a.relocate_cmd == "apply":
+            r = rl.apply_plan(rl.load_plan(a.plan_id), catalog=a.catalog)
+            if a.json:
+                print(json.dumps(r, indent=1))
+            else:
+                _print_result(r)
+            return int(r["exit_code"])
+        if a.relocate_cmd == "apply-approved":
+            out = rl.apply_approved(catalog=a.catalog)
+            if a.json:
+                print(json.dumps(out, indent=1))
+            elif out["skipped"]:
+                print(f"skipped: {out['skipped']}")
+            elif not out["results"]:
+                print("nothing approved and pending")
+            else:
+                for r in out["results"]:
+                    _print_result(r)
+            return int(out["exit_code"])
+        st = rl.status()
+        if a.json:
+            print(json.dumps(st, indent=1))
+        else:
+            print(f"{st['dir']}" + ("  [maintenance marker present]" if st["maintenance"]
+                                    else ""))
+            for p in st["plans"]:
+                print(f"  {p['plan_id']:<32} {p.get('state', 'error'):<18}"
+                      f" {human(p.get('bytes') or 0):>10}  {p.get('moves', 0)} move(s)"
+                      + (f"  {p['error']}" if p.get("error") else ""))
+        return 0
+    except rl.RelocateRefusedError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 1
+    except rl.RelocateError as exc:
+        print(f"could not run: {exc}", file=sys.stderr)
+        return 2
+
+
+def _add_relocate_parser(sub) -> None:
+    rp = sub.add_parser("relocate", help="move cold trees between drives, planned against"
+                                         " every drive's floor (plan/show/approve/apply)")
+    rsub = rp.add_subparsers(dest="relocate_cmd", required=True)
+    pl = rsub.add_parser("plan", help="measure sources and project every drive's floor")
+    pl.add_argument("--source", action="append", required=True, help="repeatable")
+    pl.add_argument("--dest-drive", required=True, help="e.g. E:")
+    pl.add_argument("--dest-root", help="default: same path on the destination drive")
+    pl.add_argument("--topology", help="storage-topology.yaml (default: $AWSTORAGE_TOPOLOGY"
+                                       " or the nearest checkout's)")
+    pl.add_argument("--mounts-file", help="host paths containers bind (JSON list or lines)")
+    pl.add_argument("--cold-days", type=float, default=14.0,
+                    help="refuse a tree modified more recently than this (default 14)")
+    pl.add_argument("--no-handle-probe", action="store_true",
+                    help="skip the psutil open-handle probe (evidence becomes null)")
+    pl.add_argument("--no-link", action="store_true", help="do not junction the old path")
+    pl.add_argument("--json", action="store_true")
+    sh = rsub.add_parser("show", help="print a stored plan")
+    sh.add_argument("plan_id")
+    sh.add_argument("--json", action="store_true")
+    apv = rsub.add_parser("approve", help="the OWNER approves a plan from a shell")
+    apv.add_argument("plan_id")
+    apv.add_argument("--i-am-the-owner", action="store_true")
+    apv.add_argument("--note")
+    cat_default = str(_AITHER / "awstorage" / "catalog.db")
+    ay = rsub.add_parser("apply", help="execute an approved plan (re-checks floors)")
+    ay.add_argument("plan_id")
+    ay.add_argument("--catalog", default=cat_default, help="ledger catalog")
+    ay.add_argument("--json", action="store_true")
+    aa = rsub.add_parser("apply-approved", help="apply every approved plan with no result"
+                                                " (the storage-relocate wake)")
+    aa.add_argument("--catalog", default=cat_default, help="ledger catalog")
+    aa.add_argument("--json", action="store_true")
+    stp = rsub.add_parser("status", help="every plan and where it stands")
+    stp.add_argument("--json", action="store_true")
+    rp.set_defaults(fn=_cmd_relocate)
 
 
 def self_test() -> int:
@@ -1131,6 +1292,7 @@ def main(argv: list[str] | None = None) -> int:
     hvp.add_argument("--json", action="store_true")
     hv.set_defaults(fn=_cmd_harvest)
 
+    _add_relocate_parser(sub)
     from .cli_suggest import add_parsers
     add_parsers(sub)
 

@@ -801,4 +801,6 @@ def test_public_api_is_exported():
     for n in ("suggest", "suggestions", "resolve_suggestion", "apply_suggestions", "trust",
               "watch_once", "place", "prune_shelf", "revert_suggestion"):
         assert hasattr(awstorage, n) and n in awstorage.__all__
-    assert awstorage.__version__ == "0.4.0"
+    # The suggestions API arrived in 0.4.0; the exact release pin lives in test_sweep.py, so a
+    # later release (0.5.0 added relocate) does not fail this feature test.
+    assert tuple(int(x) for x in awstorage.__version__.split(".")[:3]) >= (0, 4, 0)

@@ -659,12 +659,13 @@ def test_preset_agent_scratch_end_to_end_via_env(tmp_path: Path):
 
 
 def test_python_dash_m_and_version():
-    assert awstorage.__version__ == "0.4.0"
+    assert awstorage.__version__ == "0.5.0"
     r = subprocess.run([sys.executable, "-m", "awstorage", "--version"], cwd=PKG_ROOT,
-                       capture_output=True, text=True, timeout=60, check=False)
-    assert r.returncode == 0 and "0.4.0" in r.stdout
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=60, check=False)
+    assert r.returncode == 0 and "0.5.0" in r.stdout
     toml = (PKG_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'version = "0.4.0"' in toml
+    assert 'version = "0.5.0"' in toml
 
 
 def test_sweep_imports_no_sibling_at_module_load():
@@ -672,5 +673,5 @@ def test_sweep_imports_no_sibling_at_module_load():
             "bad=[m for m in ('awdit','awseal','awshare','awm','awrecover','adk','lib',"
             "'services') if m in sys.modules]; print(bad); sys.exit(1 if bad else 0)")
     r = subprocess.run([sys.executable, "-c", code], cwd=PKG_ROOT, capture_output=True,
-                       text=True, timeout=60, check=False)
+                       text=True, encoding="utf-8", errors="replace", timeout=60, check=False)
     assert r.returncode == 0, r.stdout + r.stderr

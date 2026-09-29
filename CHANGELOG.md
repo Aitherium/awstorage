@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.0 -- 2026-09-28
+
+Measured 2026-09-28: 88 GB moved D: -> C: by hand (robocopy /MOVE + a junction) with
+nothing checking the destination; C: fell from 124 GB to 18 GB free, the day after C:
+at 0 bytes corrupted the fleet root fs. A move is now PLANNED against every drive's
+floor before a byte moves.
+
+### Added
+- `awstorage relocate plan|show|approve|apply|apply-approved|status`
+  (`awstorage.relocate`). The planner measures each source (bytes, files, newest
+  mtime, nested reparse points), gathers cold evidence (psutil open handles when
+  installed, container mounts from `--mounts-file`) and projects every drive: the
+  source gains the bytes, the destination loses `bytes * 1.02`. Refused: a floor
+  crossing (`drive_floors_gb` in storage-topology.yaml), an existing destination, a
+  reparse-point source, a source under `relocate_do_not_move` / the guards' never
+  set, a tree modified within 14 days. A plan with any refusal cannot be approved.
+- `apply` refuses without `approved/<plan_id>.json` (bound to the plan's sha256),
+  re-measures and re-checks the destination floor right before each move, runs
+  `robocopy /E /MOVE /COPY:DAT /DCOPY:DAT /R:1 /W:1 /MT:16`, verifies the source is
+  empty and the destination's file count and bytes, junctions the old path, and
+  moves the tree back on any failure. Each attempted move: one ledger row
+  (`action=relocate`), one awrelay line, one Pulse event; a failed post is recorded
+  in the result and logged, never fatal.
+- `apply-approved` (the `storage-relocate` wake) applies every approved plan with no
+  result, and applies nothing while `~/.aither/maintenance.marker` exists.
 ## 0.4.0 -- 2026-09-28
 
 Measured the same day: dead agent sessions held 106 GB until found by hand; D: hit 0
