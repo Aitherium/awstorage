@@ -18,7 +18,7 @@ jobs:
       - name: Install package + test tools
         run: |
           pip install build
-          pip install -e .
+          pip install -e ".[attest]"
           pip install pytest pytest-asyncio pytest-timeout
       - name: Run the test suite before publishing
         run: |

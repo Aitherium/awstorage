@@ -23,8 +23,8 @@ import sys
 #: package cannot read the registry, and a doctor that guessed at the family
 #: would go stale in silence. Regenerate to update.
 SELF = 'awstorage'
-FAMILY = []
-PAIRS_WITH = []
+FAMILY = ['awask', 'awavatar', 'awbac', 'awbrain', 'awbrowse', 'awclassify', 'awdecide', 'awdeck', 'awdelphi', 'awdit', 'awembed', 'awevolve', 'awfind', 'awflow', 'awfocus', 'awgit', 'awgraph', 'awgym', 'awiam', 'awkno', 'awm', 'awmail', 'awmine', 'awnboard', 'awnest', 'awnet', 'awnode', 'awpool', 'awpredict', 'awprism', 'awprove', 'awreason', 'awrecover', 'awrecurse', 'awrelay', 'awrena', 'awrepl', 'awreport', 'awresearch', 'awrise', 'awrouter', 'awrtifact', 'awrun', 'awscreen', 'awseal', 'awsettings', 'awshare', 'awsprite', 'awswarm', 'awtax', 'awtoll', 'awtunnel', 'awvision', 'awvoice', 'awwall', 'gawbbonet']
+PAIRS_WITH = ['awdit', 'adk', 'awgraph', 'awm', 'awnode', 'awrecover', 'awrise', 'awseal', 'awshare']
 
 #: This brick's OWN config, read out of its source at generation time.
 #: ENV_REQUIRED is `os.environ["X"]` -- absent, that is a KeyError the moment
@@ -33,7 +33,7 @@ PAIRS_WITH = []
 #: platform-wide vars it also touches would be noise, and a doctor that floods
 #: gets ignored.
 ENV_REQUIRED = []
-ENV_OPTIONAL = ['AWSTORAGE_GATEWAY', 'AWSTORAGE_LIVE_IDS', 'AWSTORAGE_STRATA_KEY']
+ENV_OPTIONAL = ['AWSTORAGE_API', 'AWSTORAGE_CATALOG', 'AWSTORAGE_FILES_DB', 'AWSTORAGE_GATEWAY', 'AWSTORAGE_LIVE_IDS', 'AWSTORAGE_MANAGE_DB', 'AWSTORAGE_NODE', 'AWSTORAGE_PULSE_CA', 'AWSTORAGE_PULSE_URL', 'AWSTORAGE_RELOCATE_DIR', 'AWSTORAGE_STRATA_KEY', 'AWSTORAGE_TOPOLOGY']
 
 
 def _installed(mod: str) -> "str | None":

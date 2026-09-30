@@ -16,6 +16,7 @@ import errno
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -238,6 +239,7 @@ def run() -> int:
               "non-permission OSError in an emergency delete: still a failure, exit 1")
 
     run_040(check)
+    run_041(check)
     if fails:
         print(f"self-test FAIL: {len(fails)} sweep guard(s) did not fire")
         return 1
@@ -262,7 +264,7 @@ def run_040(check) -> None:
     drive keeps the item."""
     from .catalog import Catalog
     from .space import place, watch_once
-    from .suggest import apply_suggestions, suggest
+    from .suggest import apply_suggestions, set_identity_verifier, suggest
 
     with tempfile.TemporaryDirectory() as td:
         td_p = Path(td)
@@ -292,11 +294,19 @@ def run_040(check) -> None:
                 cat.update_suggestion(sid, status="applied", applied_at="2026-01-01T00:00:00")
             a = _mk(td_p / "sc" / "build" / "a.o", b"1" * 128, 30).parent
             b = _mk(td_p / "sc2" / "build" / "b.o", b"2" * 128, 30).parent
-            rd = suggest(str(a), reason="dead", suggested_by="trusted", action="delete",
-                         evidence={"bytes": 128}, catalog=cat)
-            rq = suggest(str(b), reason="dead", suggested_by="trusted",
-                         evidence={"bytes": 128}, catalog=cat)
-            rec = apply_suggestions(dry_run=False, harvest_to=td_p / "shelf", catalog=cat)
+            # a VERIFIED identity (0.4.1): the auto lane needs one, and apply re-verifies
+            # the proof stored at suggest time, so it must be JSON-serialisable.
+            proof = {"agent": "trusted", "token": "selftest-proof"}
+            set_identity_verifier(lambda agent, got: agent == "trusted" and got == proof)
+            try:
+                rd = suggest(str(a), reason="dead", suggested_by="trusted", action="delete",
+                             evidence={"bytes": 128}, catalog=cat, identity_proof=proof)
+                rq = suggest(str(b), reason="dead", suggested_by="trusted",
+                             evidence={"bytes": 128}, catalog=cat, identity_proof=proof)
+                rec = apply_suggestions(dry_run=False, harvest_to=td_p / "shelf",
+                                        catalog=cat)
+            finally:
+                set_identity_verifier(None)
             qs = list((td_p / "sc2" / ".awstorage-quarantine").glob("suggest-*/ORIGIN"))
             check(rd["status"] == "pending-card" and rq["status"] == "auto-approved"
                   and a.exists() and not b.exists() and len(qs) == 1
@@ -340,4 +350,96 @@ def run_040(check) -> None:
                   and len(rec["harvest_skipped"]) == 1 and rec["items_removed"] == 0,
                   "shelf drive under its floor: harvest-skipped, item KEPT")
         finally:
+            cat.close()
+
+
+def run_041(check) -> None:
+    """0.4.1 guards: an unverified identity never takes the auto lane, a card
+    approval without a VALID signed receipt is refused (no receipt, a hand-set
+    boolean, a forged signature -- and everything when awseal is absent), and a
+    generic session dir registered by PATH is kept by the sweep."""
+    from . import attest, manage
+    from .catalog import Catalog
+    from .policy import ApplyRefused
+    from .suggest import apply_suggestions, set_identity_verifier, suggest
+    from .sweep import live_path_hit
+
+    with tempfile.TemporaryDirectory() as td:
+        td_p = Path(td)
+        cat = Catalog(td_p / "cat.db")
+        try:
+            # 15. the auto lane is closed to an identity nobody verified.
+            for i in range(5):
+                sid = cat.put_suggestion({
+                    "node": "st", "path": f"/seed/{i}", "path_key": f"/seed/{i}",
+                    "action": "quarantine", "reason": "seed", "suggested_by": "trusted",
+                    "status": "approved"})
+                cat.update_suggestion(sid, status="applied", applied_at="2026-01-01T00:00:00")
+            item = _mk(td_p / "u" / "build" / "a.o", b"1" * 128, 30).parent
+            set_identity_verifier(None)
+            saved = os.environ.pop("AWSTORAGE_TRUST_INPROCESS", None)
+            try:
+                r = suggest(str(item), reason="dead", suggested_by="trusted",
+                            evidence={"bytes": 128}, catalog=cat)
+            finally:
+                if saved is not None:
+                    os.environ["AWSTORAGE_TRUST_INPROCESS"] = saved
+            check(r["status"] == "pending-card" and "identity unverified" in r["why"]
+                  and r.get("identity") == "unverified",
+                  "unverified suggested_by (in-process caller): card lane, never auto")
+
+            # 16. a card approval needs a VALID signed receipt.
+            facts = manage.card_facts(7)
+            card = {"id": "d-7", "status": "answered", "answer": "approve",
+                    "answered_via": "desk", "answered_by": "owner", "facts": facts,
+                    "answer_attested": True}
+            bogus = {"alg": "ed25519", "sig": "0" * 128, "receipt": {
+                "v": 1, "card_id": "d-7", "choice": "approve", "answered_by": "owner",
+                "answered_at": int(time.time()), "nonce": "0" * 32, "surface": "desk",
+                "auth_method": "webauthn", "auth_time": int(time.time()),
+                "facts_sha256": attest.facts_digest(facts)}}
+            refused = []
+            for c in (card, {**card, "answer_receipt": bogus}):
+                try:
+                    manage.verify_card(c, 7, owners=["owner"], pubkey="ab" * 32,
+                                       catalog=cat)
+                    refused.append(False)
+                except ApplyRefused:
+                    refused.append(True)
+            check(refused == [True, True],
+                  "card approval: no receipt (boolean answer_attested only) and a forged "
+                  "signature are both refused")
+
+            # 17. a generic session dir registered by PATH is kept by the sweep; its
+            #     namesake elsewhere is not protected by that registration.
+            root = td_p / "tmproot"
+            live = _mk(root / "scratchpad" / "notes.txt", b"n", 30).parent
+            other = _mk(td_p / "elsewhere" / "scratchpad" / "x.txt", b"x", 30).parent
+            ids = {str(live).replace("\\", "/").lower()}
+            check(bool(live_path_hit(str(live), ids)) and bool(live_path_hit(str(root), ids))
+                  and not live_path_hit(str(other), ids),
+                  "path live id protects that dir and its ancestors, not a namesake")
+            rec = sweep(policy=_policy(root), dry_run=False, harvest_to=td_p / "shelf3",
+                        seal=False, live_ids=[str(live)])
+            check(live.exists() and str(live).replace("\\", "/") in
+                  [x.replace("\\", "/") for x in rec["skipped_live"]],
+                  "sweep keeps a generic-named dir registered live by full path")
+
+            # 18. catalog.db is editable: a status flipped to `approved` in SQLite (no
+            #     verifiable card behind it) deletes NOTHING -- apply re-verifies.
+            victim = _mk(td_p / "work" / "notes" / "keep.txt", b"owner data", 72).parent
+            os.utime(victim, (time.time() - 72 * 3600,) * 2)
+            r = suggest(str(victim), reason="cleanup", suggested_by="agent:x",
+                        action="delete", catalog=cat)
+            raw_db = sqlite3.connect(str(cat.path))
+            with raw_db:
+                raw_db.execute("UPDATE suggestions SET status='approved' WHERE id=?",
+                               (r["id"],))
+            raw_db.close()
+            rec = apply_suggestions(dry_run=False, harvest_to=td_p / "shelf4", catalog=cat)
+            check(victim.exists() and rec["applied"] == 0 and rec.get("refused") == 1,
+                  "an `approved` status flipped in catalog.db is refused at apply; nothing "
+                  "deleted")
+        finally:
+            set_identity_verifier(None)
             cat.close()

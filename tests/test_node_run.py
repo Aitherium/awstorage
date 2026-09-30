@@ -212,7 +212,7 @@ def test_run_loop_not_once_stops_after_one_pass_when_told(tree: Path, monkeypatc
 
 # ------------------------------------------------------------ card orders (A7)
 
-def _manage_world(tmp_path: Path, *, card_over: dict | None = None):
+def _manage_world(tmp_path: Path, *, card_over: dict | None = None, sign: bool = True):
     import hashlib
     import os
 
@@ -237,9 +237,14 @@ def _manage_world(tmp_path: Path, *, card_over: dict | None = None):
     [prop] = manage.propose_dupes([{"sha256": sha, "bytes": len(data), "paths": rows}],
                                   node="test-node")
     prop.id, prop.status, prop.card_id = 41, "approved", "d-41"
+    from tests.attest_util import sign_card
+
     card = {"id": "d-41", "status": "answered", "answer": "approve",
-            "answered_via": "popup", "answered_by": "owner@test",
-            "facts": manage.card_facts(41), **(card_over or {})}
+            "answered_via": "desk", "answered_by": "owner@test",
+            "facts": manage.card_spec(prop)["facts"]}
+    if sign:
+        sign_card(card)
+    card.update(card_over or {})
     order_row = {"id": 41, "node": "test-node", "path": prop.path, "action": "quarantine-copy",
                  "bytes": prop.bytes, "cls": "dedup", "status": "approved"}
     local = Catalog(tmp_path / "node-manage.db")
@@ -272,22 +277,24 @@ def test_dispatch_covers_the_one_vocabulary():
 
 @pytest.fixture
 def attested(monkeypatch):
-    """The decisions store AFTER it attests the answerer (owner@test)."""
+    """One owner (owner@test) and the test signing key provisioned."""
     from awstorage import manage
 
-    monkeypatch.setattr(manage, "STORE_ATTESTS_ANSWERER", True)
+    from tests.attest_util import pubkey_env
+
     monkeypatch.setenv(manage.OWNERS_ENV, "owner@test")
+    pubkey_env(monkeypatch)
 
 
-def test_card_order_refused_while_the_store_does_not_attest_the_answerer(tmp_path: Path):
+def test_card_order_refused_without_a_signed_receipt(tmp_path: Path, attested):
     from awstorage.node_run import ManageContext
 
-    root, paths, prop, card, order_row, local = _manage_world(tmp_path)
+    root, paths, prop, card, order_row, local = _manage_world(tmp_path, sign=False)
     try:
         ctx = ManageContext(fetch_order=lambda pid: {"order": prop.to_dict(), "card": card},
                             catalog=local)
         [row] = apply_orders([order_row], roots=[root], manage=ctx)
-        assert row["outcome"] == "refused" and "attest" in row["detail"]
+        assert row["outcome"] == "refused" and "receipt" in row["detail"]
         assert all(p.exists() for p in paths)
     finally:
         local.close()
@@ -318,8 +325,9 @@ def test_card_order_routes_to_apply_manage_with_its_card_and_runs_once(tmp_path:
         local.close()
 
 
-@pytest.mark.parametrize("over", [{"answered_via": "agent"}, {"answered_via": "api"},
-                                  {"answered_by": None}, {"id": "d-other"},
+@pytest.mark.parametrize("over", [{"answered_via": "agent"}, {"answer_receipt": None},
+                                  {"answer_attested": True, "answer_receipt": None},
+                                  {"id": "d-other"},
                                   {"facts": ["proposal_id: 7"]}, {"answer": "reject"}])
 def test_card_order_with_a_forged_card_is_refused(tmp_path: Path, over, attested):
     from awstorage.node_run import ManageContext

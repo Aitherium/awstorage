@@ -62,20 +62,27 @@ def _isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                  "AWSTORAGE_NODE": "testnode"}.items():
         monkeypatch.setenv(k, v)
     for k in ("AWSTORAGE_LIVE_IDS", "AWSTORAGE_FLOORS", "AWSTORAGE_TRUST_THRESHOLD",
-              "AWSTORAGE_ALERT_CMD"):
+              "AWSTORAGE_ALERT_CMD", "AWSTORAGE_ATTEST_PUBKEY", "AWSTORAGE_ATTEST_PUBKEY_FILE"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("AWSTORAGE_CATALOG", str(tmp_path / "default-cat.db"))
+    # The 0.4.0 lane tests model an owner who opted in to trusting in-process callers;
+    # the 0.4.1 identity tests below delete it.
+    monkeypatch.setenv(sg.TRUST_INPROCESS_ENV, "1")
     sg.set_card_hook(None)
     sg.set_archive_hook(None)
+    sg.set_identity_verifier(None)
     yield
     sg.set_card_hook(None)
     sg.set_archive_hook(None)
+    sg.set_identity_verifier(None)
 
 
 @pytest.fixture
 def cat(tmp_path: Path):
     c = Catalog(tmp_path / "cat.db")
+    _CAT[:] = [c]
     yield c
+    _CAT.clear()
     c.close()
 
 
@@ -126,9 +133,34 @@ def old_build(root: Path, n: int = 128) -> Path:
     return item
 
 
-def attested_card(cid: str, pid: int, answer: str = "approve") -> dict:
-    return {"id": cid, "status": "answered", "answered_via": "desk", "answered_by": "owner",
-            "answer": answer, "facts": [f"proposal_id: {pid}"]}
+#: The catalog of the running test (set by the `cat` fixture), so `attested_card` signs
+#: the REAL card facts -- including `content_sha256` -- of a filed suggestion.
+_CAT: list = []
+
+
+def _suggestion_facts(pid: int) -> list[str]:
+    s = _CAT[0].get_suggestion(pid) if _CAT else None
+    return sg.card_spec(s)["facts"] if s else [f"proposal_id: {pid}"]
+
+
+def attested_card(cid: str, pid: int, answer: str = "approve", sign: bool = True) -> dict:
+    """The owner's answer, SIGNED with the test key (tests.attest_util)."""
+    card = {"id": cid, "status": "answered", "answered_via": "desk", "answered_by": "owner",
+            "answer": answer, "facts": _suggestion_facts(pid)}
+    if sign:
+        from tests.attest_util import sign_card
+
+        sign_card(card, answered_by="owner")
+    return card
+
+
+@pytest.fixture
+def signing(monkeypatch):
+    """One owner ("owner") and the test signing key provisioned."""
+    from tests.attest_util import pubkey_env
+
+    monkeypatch.setenv(manage.OWNERS_ENV, "owner")
+    pubkey_env(monkeypatch)
 
 
 # -- git check -----------------------------------------------------------------------
@@ -386,29 +418,26 @@ def test_card_hook_receives_proposal_id_fact(tmp_path: Path, cat):
 
 # -- resolve -------------------------------------------------------------------------
 
-def test_card_approval_refused_while_store_does_not_attest(tmp_path: Path, cat, monkeypatch):
-    assert manage.STORE_ATTESTS_ANSWERER is False
-    monkeypatch.setenv(manage.OWNERS_ENV, "owner")
+def test_card_approval_refused_without_a_signed_receipt(tmp_path: Path, cat, signing):
+    assert manage.STORE_ATTESTS_ANSWERER is True  # the master switch ships ON (0.4.1)
     it = old_build(tmp_path)
     r = sg.suggest(str(it), reason="r", suggested_by="a", action="delete", catalog=cat)
-    out = sg.resolve_suggestion(r["id"], "approve", card=attested_card("c1", r["id"]),
-                                catalog=cat)
-    assert not out["ok"] and "does not attest" in out["why"]
+    unsigned = dict(attested_card("c1", r["id"], sign=False), answer_attested=True)
+    out = sg.resolve_suggestion(r["id"], "approve", card=unsigned, catalog=cat)
+    assert not out["ok"] and "no signed answer receipt" in out["why"]
     assert cat.get_suggestion(r["id"])["status"] == "pending-card"
     out = sg.resolve_suggestion(r["id"], "approve", catalog=cat)
     assert not out["ok"] and "CARD-ONLY" in out["why"]
 
 
-def test_card_approval_uses_the_manage_checks(tmp_path: Path, cat, monkeypatch):
-    monkeypatch.setattr(manage, "STORE_ATTESTS_ANSWERER", True)
-    monkeypatch.setenv(manage.OWNERS_ENV, "owner")
+def test_card_approval_uses_the_manage_checks(tmp_path: Path, cat, signing):
     it = old_build(tmp_path)
     r = sg.suggest(str(it), reason="r", suggested_by="a", action="delete", catalog=cat)
     wrong = sg.resolve_suggestion(r["id"], "approve",
                                   card=attested_card("c1", r["id"] + 1000), catalog=cat)
     assert not wrong["ok"] and "proposal_id" in wrong["why"]
-    via_api = dict(attested_card("c1", r["id"]), answered_via="api")
-    assert not sg.resolve_suggestion(r["id"], "approve", card=via_api, catalog=cat)["ok"]
+    tampered = dict(attested_card("c1", r["id"]), answered_via="agent")
+    assert not sg.resolve_suggestion(r["id"], "approve", card=tampered, catalog=cat)["ok"]
     ok = sg.resolve_suggestion(r["id"], "approve", card=attested_card("c1", r["id"]),
                                catalog=cat)
     assert ok["ok"] and ok["status"] == "approved"
@@ -526,9 +555,7 @@ def test_auto_approval_is_withdrawn_when_trust_falls(tmp_path: Path, cat):
     assert cat.get_suggestion(r["id"])["status"] == "pending-card"
 
 
-def test_card_approved_delete_harvests_then_deletes(tmp_path: Path, cat, monkeypatch):
-    monkeypatch.setattr(manage, "STORE_ATTESTS_ANSWERER", True)
-    monkeypatch.setenv(manage.OWNERS_ENV, "owner")
+def test_card_approved_delete_harvests_then_deletes(tmp_path: Path, cat, signing):
     it = old_build(tmp_path)
     r = sg.suggest(str(it), reason="dead", suggested_by="a", action="delete", catalog=cat)
     assert sg.resolve_suggestion(r["id"], "approve", card=attested_card("c", r["id"]),
@@ -539,9 +566,7 @@ def test_card_approved_delete_harvests_then_deletes(tmp_path: Path, cat, monkeyp
     assert sg.trust("a", catalog=cat)[0]["applied"] == 1
 
 
-def test_archive_waits_for_a_hook_then_applies(tmp_path: Path, cat, monkeypatch):
-    monkeypatch.setattr(manage, "STORE_ATTESTS_ANSWERER", True)
-    monkeypatch.setenv(manage.OWNERS_ENV, "owner")
+def test_archive_waits_for_a_hook_then_applies(tmp_path: Path, cat, signing):
     it = old_build(tmp_path)
     r = sg.suggest(str(it), reason="cold", suggested_by="a", action="archive", catalog=cat)
     sg.resolve_suggestion(r["id"], "approve", card=attested_card("c", r["id"]), catalog=cat)
@@ -804,3 +829,90 @@ def test_public_api_is_exported():
     # The suggestions API arrived in 0.4.0; the exact release pin lives in test_sweep.py, so a
     # later release (0.5.0 added relocate) does not fail this feature test.
     assert tuple(int(x) for x in awstorage.__version__.split(".")[:3]) >= (0, 4, 0)
+    assert hasattr(awstorage, "set_identity_verifier")
+
+
+# -- 0.4.1: identity -----------------------------------------------------------------
+
+def test_unverified_identity_never_takes_the_auto_lane(tmp_path: Path, cat, monkeypatch):
+    monkeypatch.delenv(sg.TRUST_INPROCESS_ENV, raising=False)
+    seed_trust(cat, "trusted", applied=9)
+    it = old_build(tmp_path / "p")
+    r = sg.suggest(str(it), reason="dead", suggested_by="trusted",
+                   evidence={"bytes": 136}, catalog=cat)
+    assert r["status"] == "pending-card" and "identity unverified" in r["why"]
+    assert r["identity"] == "unverified"
+    assert cat.get_suggestion(r["id"])["identity"] == "unverified"
+
+
+@pytest.mark.parametrize("verifier,proof,want", [
+    (lambda a, p: p == "sig:trusted", "sig:trusted", "auto-approved"),
+    (lambda a, p: p == "sig:trusted", "sig:forged", "pending-card"),
+    (lambda a, p: "yes", "sig:trusted", "pending-card"),     # only the boolean True
+    (lambda a, p: 1 / 0, "sig:trusted", "pending-card"),     # a failing verifier
+    (lambda a, p: True, None, "pending-card"),               # no proof offered
+])
+def test_identity_verifier_opens_the_auto_lane(tmp_path, cat, monkeypatch, verifier, proof,
+                                               want):
+    monkeypatch.delenv(sg.TRUST_INPROCESS_ENV, raising=False)
+    sg.set_identity_verifier(verifier)
+    seed_trust(cat, "trusted", applied=9)
+    it = old_build(tmp_path / "p")
+    r = sg.suggest(str(it), reason="dead", suggested_by="trusted",
+                   evidence={"bytes": 136}, catalog=cat, identity_proof=proof)
+    assert r["status"] == want, r
+
+
+def test_inprocess_trust_is_rechecked_at_apply(tmp_path: Path, cat, monkeypatch):
+    r, it = _auto(tmp_path, cat)
+    assert cat.get_suggestion(r["id"])["identity"] == "inprocess-trusted"
+    monkeypatch.delenv(sg.TRUST_INPROCESS_ENV)
+    rec = sg.apply_suggestions(dry_run=False, harvest_to=tmp_path / "shelf", catalog=cat)
+    assert rec["demoted"] == 1 and it.exists()
+    s = cat.get_suggestion(r["id"])
+    assert s["status"] == "pending-card" and "identity" in s["why"]
+
+
+def test_a_040_catalog_opens_and_its_rows_read_unverified(tmp_path: Path):
+    import sqlite3
+
+    db = tmp_path / "old.db"
+    Catalog(db).close()
+    con = sqlite3.connect(str(db))
+    con.execute("ALTER TABLE suggestions DROP COLUMN identity")
+    con.commit()
+    con.close()
+    c = Catalog(db)
+    try:
+        sid = c.put_suggestion({"node": "n", "path": "/x", "path_key": "/x",
+                                "action": "quarantine", "reason": "r", "suggested_by": "a",
+                                "status": "auto-approved"})
+        assert c.get_suggestion(sid)["identity"] == "unverified"
+    finally:
+        c.close()
+
+
+# -- 0.4.1: path live ids --------------------------------------------------------------
+
+def test_path_live_id_protects_a_generic_dir_not_its_namesakes(tmp_path: Path, monkeypatch):
+    live = tmp_path / "sessA" / "scratchpad"
+    other = tmp_path / "sessB" / "scratchpad"
+    ids = {str(live).replace("\\", "/").lower()}
+    assert sw.live_path_hit(str(live), ids)
+    assert sw.live_path_hit(str(live / "sub"), ids)
+    assert sw.live_path_hit(str(tmp_path / "sessA"), ids)   # an ancestor
+    assert not sw.live_path_hit(str(other), ids)
+    assert not sw.live_path_hit(str(tmp_path / "sessA2"), ids)
+
+
+def test_suggest_refuses_a_path_registered_live_by_full_path(tmp_path: Path, cat,
+                                                             monkeypatch):
+    it = old_build(tmp_path / "sess")
+    monkeypatch.setenv("AWSTORAGE_LIVE_IDS", "")
+    f = tmp_path / "live-ids.txt"
+    f.write_text(f"{it.parent}  # pid=1 agent=x\n", encoding="utf-8")
+    assert sw.live_path_hit(str(it), sw.load_live_ids((), str(f), env={}))
+    # suggest reads the env contract; a path id in the env is honoured the same way
+    monkeypatch.setenv("AWSTORAGE_LIVE_IDS", str(it.parent).replace("\\", "/"))
+    r = sg.suggest(str(it), reason="dead", suggested_by="a", catalog=cat)
+    assert r["status"] == "refused" and "live" in r["why"]

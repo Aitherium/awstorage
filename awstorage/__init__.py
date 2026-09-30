@@ -46,8 +46,10 @@ writes a receipt on every exit path.
 a path. It validates (guards, git clean + pushed, live window, evidence), then
 either auto-approves a regenerable quarantine from a trusted agent or files it for
 a decision card; `apply_suggestions()` re-verifies before acting, and every outcome
-feeds the agent's trust score. `watch_once()` keeps drives above their floors
-cheaply; `place()` refuses a move that would push a drive under its floor.
+feeds the agent's trust score. The auto lane needs a VERIFIED agent identity
+(`set_identity_verifier`); a card approval needs a SIGNED answer receipt
+(`awstorage.attest`, public key in the file named by `$AWSTORAGE_ATTEST_PUBKEY_FILE`, awseal to verify).
+`watch_once()` keeps drives above their floors cheaply; `place()` refuses a move that would push a drive under its floor.
 
 The package is stdlib-only and speaks to nothing. Fleet integration (a scanner
 per node, a catalog behind an API, a GUI, an autonomous steward, model-backed
@@ -88,13 +90,15 @@ from .suggest import (
     revert_suggestion,
     set_archive_hook,
     set_card_hook,
+    set_card_reader,
+    set_identity_verifier,
     suggest,
     suggestions,
     trust,
 )
 from .sweep import LIVE_IDS_ENV, SweepConfigError, presets, sweep
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -134,7 +138,9 @@ __all__ = [
     "apply_suggestions",
     "trust",
     "set_card_hook",
+    "set_card_reader",
     "set_archive_hook",
+    "set_identity_verifier",
     "watch_once",
     "place",
     "parse_floors",

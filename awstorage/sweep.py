@@ -724,6 +724,10 @@ def load_live_ids(ids: Iterable[str] = (), ids_file: str | None = None,
     id per line, `#` comments allowed. An id matches an item's BASENAME,
     case-insensitively -- e.g. the session-id directory of a scratchpad.
     An unreadable --live-ids file raises: guessing "nobody is live" deletes live work.
+    An id containing a path separator is a PATH id (:func:`live_path_hit`): it keeps
+    that path, everything under it and every ancestor of it -- how a runtime marks a
+    session dir whose basename is generic (``scratchpad``, ``tmp``) live without
+    blocking every other dir of that name.
     """
     e = os.environ if env is None else env
     out = {i.strip().lower() for i in ids if i and i.strip()}
@@ -739,6 +743,26 @@ def load_live_ids(ids: Iterable[str] = (), ids_file: str | None = None,
             if line:
                 out.add(line.lower())
     return out
+
+
+def _live_norm(p: str) -> str:
+    norm = os.path.normcase(os.path.abspath(os.path.expanduser(str(p))))
+    return norm.replace("\\", "/").rstrip("/").lower()
+
+
+def live_path_hit(item: str, live: Iterable[str]) -> str | None:
+    """The PATH live id (one containing ``/`` or a backslash) that protects ``item``: the
+    item IS that path, lies under it, or is an ancestor of it (removing a parent
+    removes the live dir). None when no path id applies."""
+    paths = [i for i in live if "/" in i or "\\" in i]
+    if not paths:
+        return None
+    it = _live_norm(item)
+    for raw in paths:
+        lp = _live_norm(raw)
+        if lp and (it == lp or lp.startswith(it + "/") or it.startswith(lp + "/")):
+            return raw
+    return None
 
 
 # -- removal -----------------------------------------------------------------------
@@ -1150,7 +1174,7 @@ def _one_item(rec: dict, *, item: str, base: str, rule: dict, include_rx, exclud
     prot = _protected(item, protect)
     if prot:
         return keep("skipped", f"protected: holds {prot}")
-    if name.lower() in rule_live:
+    if name.lower() in rule_live or live_path_hit(item, rule_live):
         rec["skipped_live"].append(item)
         audit("skipped-live", path=item, rule=rule["name"], why="registered live id")
         ledger(item, rule, "skipped-live", detail="registered live id")
@@ -1518,6 +1542,7 @@ __all__ = [
     "expand_path",
     "glob_to_regex",
     "harvest_item",
+    "live_path_hit",
     "load_live_ids",
     "measure",
     "parse_duration",

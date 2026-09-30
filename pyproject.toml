@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "awstorage"
-version = "0.5.0"
+version = "0.5.1"
 description = "Scan a drive, get a ranked inventory of what fills it, classified re-fetchable or not, diffed against last time -- before you delete anything."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,7 +23,10 @@ yaml = ["pyyaml>=6.0"]
 # (sealed harvest shelf), awshare (publish a day's harvest). All imported lazily;
 # the sweep runs without them and says so in its receipt.
 harvest = ["awseal>=0.1.1", "awdit>=0.1.0", "awshare>=0.1.1"]
-dev = ["pytest>=7.0"]
+# Verifying a signed decision-card answer receipt (awstorage.attest) needs awseal's
+# Ed25519 verifier. Without it every card approval is REFUSED, never waved through.
+attest = ["awseal>=0.1.1"]
+dev = ["pytest>=7.0", "awseal>=0.1.1"]
 
 [project.scripts]
 awstorage = "awstorage.cli:main"

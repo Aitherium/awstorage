@@ -107,7 +107,11 @@ CREATE TABLE IF NOT EXISTS suggestions (
   quarantine TEXT,
   harvest TEXT,
   reverted_at TEXT,
-  purged_at TEXT
+  purged_at TEXT,
+  identity TEXT NOT NULL DEFAULT 'unverified',
+  identity_proof TEXT,
+  card_snapshot TEXT,
+  receipt_digest TEXT
 );
 CREATE INDEX IF NOT EXISTS suggestions_path ON suggestions(path_key, status);
 CREATE INDEX IF NOT EXISTS suggestions_agent ON suggestions(suggested_by);
@@ -118,8 +122,11 @@ _SUGGESTION_MUTABLE = frozenset({
     "status", "prev_status", "why", "cls", "size", "files", "newest_mtime", "capped",
     "checks", "expires_at", "card_id", "card_raised", "approved_at", "resolved_by",
     "applied_at", "outcome", "bytes_freed", "quarantine", "harvest", "reverted_at",
-    "purged_at",
+    "purged_at", "card_snapshot", "receipt_digest",
 })
+#: v0.4.1 columns added to an older catalog on open (all nullable; see Catalog.__init__).
+_SUGGESTION_ADDED = {"identity_proof": "TEXT", "card_snapshot": "TEXT",
+                     "receipt_digest": "TEXT"}
 #: Suggestion status -> the coarse status its `proposals` row mirrors (dashboards).
 _SUGGESTION_TO_PROPOSAL = {
     "refused": "refused", "pending-card": "proposed", "auto-approved": "approved",
@@ -150,6 +157,20 @@ class Catalog:
         if "git" not in cols:
             with self._db:
                 self._db.execute("ALTER TABLE trees ADD COLUMN git INTEGER NOT NULL DEFAULT 0")
+        # v0.4.1: suggestions.identity (verified | inprocess-trusted | unverified). A
+        # 0.4.0 row reads 'unverified', so its auto approval is withdrawn at apply.
+        scols = {r[1] for r in self._db.execute("PRAGMA table_info(suggestions)")}
+        if "identity" not in scols:
+            with self._db:
+                self._db.execute("ALTER TABLE suggestions ADD COLUMN identity TEXT NOT NULL"
+                                 " DEFAULT 'unverified'")
+        # v0.4.1 (review 2): the verified card + receipt digest recorded at resolve, and
+        # the identity proof, so apply RE-VERIFIES instead of trusting `status`. A row
+        # without them cannot be applied as approved (it is refused, never acted on).
+        for name, decl in _SUGGESTION_ADDED.items():
+            if name not in scols:
+                with self._db:
+                    self._db.execute(f"ALTER TABLE suggestions ADD COLUMN {name} {decl}")
 
     def close(self) -> None:
         self._db.close()
@@ -315,6 +336,11 @@ class Catalog:
         d["checks"] = json.loads(d.get("checks") or "[]")
         d["harvest"] = json.loads(d["harvest"]) if d.get("harvest") else None
         d["capped"] = bool(d.get("capped"))
+        for k in ("card_snapshot", "identity_proof"):
+            try:
+                d[k] = json.loads(d[k]) if d.get(k) else None
+            except ValueError:
+                d[k] = None  # unreadable -> absent -> refused where it matters
         return d
 
     def put_suggestion(self, s: dict) -> int:
@@ -339,15 +365,19 @@ class Catalog:
             self._db.execute(
                 "INSERT INTO suggestions(id, created_at, updated_at, node, path, path_key,"
                 " action, reason, suggested_by, evidence, status, why, cls, size, files,"
-                " newest_mtime, capped, checks, expires_at, approved_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " newest_mtime, capped, checks, expires_at, approved_at, identity,"
+                " identity_proof)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (sid, now, now, s["node"], s["path"], s["path_key"], s["action"],
                  s["reason"], s["suggested_by"],
                  json.dumps(s.get("evidence") or {}, sort_keys=True, default=str),
                  s["status"], s.get("why"), s.get("cls"), s.get("size"), s.get("files"),
                  s.get("newest_mtime"), 1 if s.get("capped") else 0,
                  json.dumps(s.get("checks") or []), s.get("expires_at"),
-                 now if s["status"] == "auto-approved" else None))
+                 now if s["status"] == "auto-approved" else None,
+                 str(s.get("identity") or "unverified"),
+                 None if s.get("identity_proof") is None
+                 else json.dumps(s["identity_proof"], sort_keys=True, default=str)))
         return sid
 
     def get_suggestion(self, sid: int) -> dict | None:
@@ -382,7 +412,7 @@ class Catalog:
         bad = set(fields) - _SUGGESTION_MUTABLE
         if bad:
             raise ValueError(f"not updatable: {sorted(bad)}")
-        for k in ("checks", "harvest"):
+        for k in ("checks", "harvest", "card_snapshot"):
             if k in fields and not isinstance(fields[k], (str, type(None))):
                 fields[k] = json.dumps(fields[k], sort_keys=True, default=str)
         if "capped" in fields:

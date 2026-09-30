@@ -19,13 +19,26 @@ open suggestion for the same path is a ``duplicate`` (the first one's id).
 (``build-temp`` / ``package-cache`` -- agent scratch and temp resolve to
 ``build-temp`` through the sweep presets), the action is ``quarantine`` (never
 delete, never archive), the evidence verifies (at least one checkable claim, none
-contradicted), no nested work tree is dirty or unjudged, and the suggesting agent's
-trust is at or above the threshold. Everything else is ``pending-card``: a decision
+contradicted), no nested work tree is dirty or unjudged, the suggesting agent's
+identity is VERIFIED (see below) and its trust is at or above the threshold.
+Everything else is ``pending-card``: a decision
 card is raised through the hook set by :func:`set_card_hook` (none by default --
 the suggestion then waits, listed by :func:`suggestions`). Approving a card-lane
 suggestion requires a card that passes ``awstorage.manage.verify_card`` -- the SAME
-function manage uses, so while ``manage.STORE_ATTESTS_ANSWERER`` is False every
-human approval is refused (fail closed) and flips only where manage flips.
+function manage uses: a SIGNED answer receipt from the platform's attestation key
+(``awstorage.attest``), never the card's own ``answered_by``/``answer_attested``.
+
+**Apply trusts no status.** ``catalog.db`` is a file any local process can edit, so
+an ``approved`` row is RE-VERIFIED at apply: the card recorded at resolve (or the live
+card, when :func:`set_card_reader` is installed) must pass ``manage.verify_card``
+again (signature, owner, fresh sign-in, receipt age, nonce), be the card the row
+names, carry the receipt whose digest was recorded at resolve, and carry the
+``content_sha256`` fact equal to the digest of the row as it stands now
+(:func:`suggestion_content_digest` -- path, action, node, class, size, ...). An
+``auto-approved`` row re-checks every lane condition (regenerable class re-classified
+from disk, quarantine only, evidence re-verified, identity RE-VERIFIED by the installed
+verifier against the proof stored at suggest time, trust). Anything that does not
+verify is ``refused`` -- nothing is deleted on a status alone.
 
 **Apply** re-validates everything, refuses on drift (size / file count / newest
 mtime changed since the suggestion), harvests first (the sweep's verified harvest;
@@ -45,9 +58,19 @@ so its first suggestions go to cards. Each applied suggestion raises it, each
 rejection lowers it, and one revert of an applied suggestion costs three
 applications. It can go negative. The threshold (``$AWSTORAGE_TRUST_THRESHOLD``) is
 clamped to at least ``MIN_TRUST_THRESHOLD`` so a brand-new agent can never
-auto-approve. ``suggested_by`` is caller-declared: a transport that authenticates
-agents (MCP, awdk) must stamp it from the authenticated caller, never pass it
-through from a payload.
+auto-approve.
+
+**Identity.** ``suggested_by`` is caller-declared, and every caller of this module is
+in-process -- the brick cannot tell an agent from something typing its name. So the
+auto lane requires a VERIFIED identity: a verifier installed with
+:func:`set_identity_verifier` (``fn(suggested_by, proof) -> bool``, e.g. one that
+checks an agent-signed token) accepted the ``identity_proof`` passed to
+:func:`suggest`. Without one every suggestion is ``identity: unverified`` and goes to
+a card, whatever its trust -- unless the owner sets ``AWSTORAGE_TRUST_INPROCESS=1``
+(recorded on the row as ``inprocess-trusted``, and re-checked at apply). The trust
+ledger is still kept for every name; it just cannot open the auto lane on its own.
+Transports stamp what they know: MCP ``mcp-session:<uid>`` (a session, never "the
+owner"), awdk ``agent:<name>``.
 """
 
 from __future__ import annotations
@@ -72,6 +95,7 @@ from .sweep import (
     expand_path,
     glob_to_regex,
     harvest_item,
+    live_path_hit,
     load_live_ids,
     measure,
     parse_duration,
@@ -101,10 +125,18 @@ SHELF_RULE = "suggestions"
 QUARANTINE_PREFIX = "suggest-"
 _AGENT_RX = re.compile(r"^[A-Za-z0-9_.:@/\-]{1,128}$")
 
+#: Owner opt-in: treat in-process callers' ``suggested_by`` as verified (auto lane).
+TRUST_INPROCESS_ENV = "AWSTORAGE_TRUST_INPROCESS"
+IDENTITY_VALUES = ("verified", "inprocess-trusted", "unverified")
+
 CardHook = Callable[[dict], Any]
 ArchiveHook = Callable[[Path, dict], dict]
+IdentityVerifier = Callable[[str, Any], bool]
+CardReader = Callable[[str], Any]
 _card_hook: CardHook | None = None
 _archive_hook: ArchiveHook | None = None
+_identity_verifier: IdentityVerifier | None = None
+_card_reader: CardReader | None = None
 
 
 def set_card_hook(fn: CardHook | None) -> None:
@@ -124,6 +156,78 @@ def set_archive_hook(fn: ArchiveHook | None) -> None:
     hook an approved archive waits (never falls back to delete)."""
     global _archive_hook
     _archive_hook = fn
+
+
+def set_card_reader(fn: CardReader | None) -> None:
+    """Install ``fn(card_id) -> card | None`` that reads a decision card from its store.
+    With it, apply re-reads the LIVE card of an approved suggestion; without it, apply
+    re-verifies the card recorded at resolve. Either way the receipt must still verify
+    and match the digest recorded at resolve."""
+    global _card_reader
+    _card_reader = fn
+
+
+def set_identity_verifier(fn: IdentityVerifier | None) -> None:
+    """Install the agent-identity verifier: ``fn(suggested_by, proof) -> bool``. Only
+    ``True`` (the boolean) verifies; an exception is a refusal. The auto lane is
+    closed to every suggestion it has not verified."""
+    global _identity_verifier
+    _identity_verifier = fn
+
+
+def _trust_inprocess(env: Mapping[str, str] | None = None) -> bool:
+    e = os.environ if env is None else env
+    return (e.get(TRUST_INPROCESS_ENV) or "").strip() == "1"
+
+
+def identity_of(agent: str, proof: Any = None, env: Mapping[str, str] | None = None
+                ) -> tuple[str, str]:
+    """(identity, detail): ``verified`` | ``inprocess-trusted`` | ``unverified``."""
+    if _identity_verifier is not None and proof is not None:
+        try:
+            ok = _identity_verifier(agent, proof) is True
+        except Exception as exc:  # noqa: BLE001 -- a verifier that fails verifies nothing
+            return "unverified", f"identity verifier failed: {type(exc).__name__}"
+        if ok:
+            return "verified", "identity verifier accepted the proof"
+        return "unverified", "identity verifier rejected the proof"
+    if _trust_inprocess(env):
+        return "inprocess-trusted", f"{TRUST_INPROCESS_ENV}=1 (owner opt-in)"
+    why = "no identity verifier installed" if _identity_verifier is None else "no proof"
+    return "unverified", f"in-process caller, {why}: suggested_by is caller-declared"
+
+
+def _identity_holds(s: Mapping[str, Any]) -> bool:
+    """Re-judge the identity at apply. ``verified`` is NOT read from the row: the
+    installed verifier must accept the proof stored at suggest time again (a row edited
+    to say ``verified`` without a proof the verifier accepts is not)."""
+    ident = str(s.get("identity") or "unverified")
+    if ident == "verified":
+        proof = s.get("identity_proof")
+        if _identity_verifier is None or proof is None:
+            return False
+        try:
+            return _identity_verifier(str(s.get("suggested_by") or ""), proof) is True
+        except Exception:  # noqa: BLE001 -- a verifier that fails verifies nothing
+            return False
+    return ident == "inprocess-trusted" and _trust_inprocess()
+
+
+def suggestion_content_digest(s: Mapping[str, Any]) -> str:
+    """sha256 of WHAT a suggestion card approves: id, node, path (+ key), action,
+    suggested_by, class, size, file count, newest mtime, capped. Bound into the card as
+    ``content_sha256`` and recomputed from the row at resolve and at apply."""
+    import hashlib
+    import json
+
+    body = {"v": 1, "kind": "suggestion", "id": int(s["id"]), "node": str(s.get("node")),
+            "path": str(s.get("path")), "path_key": str(s.get("path_key")),
+            "action": str(s.get("action")), "suggested_by": str(s.get("suggested_by")),
+            "cls": s.get("cls"), "size": s.get("size"), "files": s.get("files"),
+            "newest_mtime": s.get("newest_mtime"), "capped": bool(s.get("capped"))}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False, default=str).encode("utf-8")
+                          ).hexdigest()
 
 
 # -- helpers -------------------------------------------------------------------------
@@ -287,7 +391,7 @@ def _validate(path: str, *, now: float, env: Mapping[str, str] | None,
     checks.append("guards: ok")
     live = load_live_ids(env=env)
     segs = [s.lower() for s in p.split("/") if s]
-    hit = next((s for s in segs if s in live), None)
+    hit = next((s for s in segs if s in live), None) or live_path_hit(p, live)
     if hit:
         return refuse("live-ids", f"segment {hit!r} is a registered live id")
     checks.append("live-ids: ok")
@@ -412,7 +516,7 @@ def _protect_list(cat) -> list[str]:
 def card_spec(s: Mapping[str, Any]) -> dict:
     """The decision card that asks a human to approve suggestion `s`. It carries the
     fact ``proposal_id: <id>`` that ``manage.verify_card`` requires."""
-    from .manage import card_facts
+    from .manage import card_facts, content_fact
 
     size = s.get("size")
     gb = f"{int(size) / 2**30:.2f} GB" if size is not None else "size unknown (capped)"
@@ -427,7 +531,8 @@ def card_spec(s: Mapping[str, Any]) -> dict:
     facts = card_facts(int(s["id"])) + [
         f"node: {s['node']}", f"path: {s['path']}", f"action: {s['action']}",
         f"class: {s.get('cls')}", f"bytes: {size if size is not None else 'unknown'}",
-        f"suggested_by: {s['suggested_by']}", f"expires: {s.get('expires_at')}"]
+        f"suggested_by: {s['suggested_by']}", f"expires: {s.get('expires_at')}",
+        content_fact(suggestion_content_digest(s))]
     return {"title": title,
             "summary": f"{s['suggested_by']} suggests: {s['reason']} {rev}",
             "facts": facts, "options": ["approve|Approve", "reject|Reject: keep it"],
@@ -454,14 +559,16 @@ def _raise_card(cat, sid: int) -> str | None:
 # -- the API -------------------------------------------------------------------------
 
 def suggest(path: str, *, reason: str, suggested_by: str, action: str = "quarantine",
-            evidence: dict | None = None, ttl_days: float = 7.0, catalog: Any = None
-            ) -> dict:
+            evidence: dict | None = None, ttl_days: float = 7.0, catalog: Any = None,
+            identity_proof: Any = None) -> dict:
     """An agent proposes removing `path`. Never acts; decides the lane.
 
     Returns ``{id, status, why, class, size, checks}`` (+ ``trust``, ``card_id``):
     status ``auto-approved`` | ``pending-card`` | ``refused`` | ``duplicate``.
     ``size`` is None when the measure was capped. Raises ValueError for malformed
     arguments (unknown action, empty reason/agent, ttl out of range).
+    ``identity_proof`` is handed to the verifier set by :func:`set_identity_verifier`;
+    without a verified identity the suggestion never takes the auto lane.
     """
     if action not in SUGGEST_ACTIONS:
         raise ValueError(f"action {action!r} not in {SUGGEST_ACTIONS}")
@@ -495,6 +602,7 @@ def suggest(path: str, *, reason: str, suggested_by: str, action: str = "quarant
         checks = ["dedupe: ok"] + v["checks"]
         tr = _agent_trust(cat, agent)
         thr = trust_threshold()
+        ident, ident_detail = identity_of(agent, identity_proof)
         status, why = "refused", v["why"]
         if v["ok"]:
             ev, ev_detail = _verify_evidence(evidence, v, now)
@@ -511,8 +619,11 @@ def suggest(path: str, *, reason: str, suggested_by: str, action: str = "quarant
                     blockers.append(f"evidence {ev}")
                 if not v["nested_ok"]:
                     blockers.append(f"nested work tree: {v['nested_why']}")
+                if ident == "unverified":
+                    blockers.append(f"identity unverified ({ident_detail})")
                 if tr < thr:
                     blockers.append(f"trust {tr:.2f} < {thr:.2f}")
+                checks.append(f"identity: {ident} ({ident_detail})")
                 checks.append(f"trust: {agent} {tr:.2f} (threshold {thr:.2f})")
                 if blockers:
                     status = "pending-card"
@@ -520,7 +631,7 @@ def suggest(path: str, *, reason: str, suggested_by: str, action: str = "quarant
                 else:
                     status = "auto-approved"
                     why = (f"regenerable {v['cls']}, quarantine, evidence verified, "
-                           f"trust {tr:.2f} >= {thr:.2f}")
+                           f"identity {ident}, trust {tr:.2f} >= {thr:.2f}")
         expires = (datetime.now(timezone.utc) + timedelta(days=float(ttl_days))
                    ).isoformat(timespec="seconds")
         sid = cat.put_suggestion({
@@ -528,11 +639,13 @@ def suggest(path: str, *, reason: str, suggested_by: str, action: str = "quarant
             "reason": reason, "suggested_by": agent, "evidence": evidence or {},
             "status": status, "why": why, "cls": v["cls"], "size": v["size"],
             "files": v["files"], "newest_mtime": v["newest_mtime"], "capped": v["capped"],
-            "checks": checks, "expires_at": expires})
+            "checks": checks, "expires_at": expires, "identity": ident,
+            # kept so apply can RE-VERIFY the identity (never read `verified` off the row)
+            "identity_proof": identity_proof if ident == "verified" else None})
         card_id = _raise_card(cat, sid) if status == "pending-card" else None
         return {"id": sid, "status": status, "why": why, "class": v["cls"],
                 "size": v["size"], "checks": checks, "trust": round(tr, 4),
-                "card_id": card_id}
+                "identity": ident, "card_id": card_id}
     finally:
         if own:
             cat.close()
@@ -574,8 +687,8 @@ def resolve_suggestion(id: int, decision: str, *, card: dict | None = None,
                        catalog: Any = None) -> dict:
     """A human decision on a suggestion. ``reject`` needs no card (keeping is always
     safe). ``approve`` needs a decision card that passes ``manage.verify_card`` for
-    THIS id -- the same owner/surface/attestation checks manage applies, so it is
-    refused while ``manage.STORE_ATTESTS_ANSWERER`` is False.
+    THIS id -- the same signed-receipt check manage applies (the receipt's nonce is
+    recorded in this catalog).
 
     Returns ``{id, ok, status, why}``.
     """
@@ -597,7 +710,7 @@ def resolve_suggestion(id: int, decision: str, *, card: dict | None = None,
             cid = ""
             if card is not None:
                 try:
-                    cid, _ans = manage.card_decision(card, int(s["id"]))
+                    cid, _ans = manage.card_decision(card, int(s["id"]), catalog=cat)
                 except ApplyRefused:
                     cid = ""
             ok = cat.update_suggestion(
@@ -610,20 +723,85 @@ def resolve_suggestion(id: int, decision: str, *, card: dict | None = None,
             return {"id": s["id"], "ok": True, "status": s["status"],
                     "why": f"already {s['status']}"}
         try:
-            cid = manage.verify_card(card, int(s["id"]))
+            cid = manage.verify_card(card, int(s["id"]), catalog=cat)
         except ApplyRefused as exc:
             return {"id": s["id"], "ok": False, "status": s["status"], "why": str(exc)}
         if s.get("card_raised") and str(s["card_raised"]) != cid:
             return {"id": s["id"], "ok": False, "status": s["status"],
                     "why": f"card {cid} is not the card raised for it ({s['card_raised']})"}
+        try:
+            manage.require_content(card, suggestion_content_digest(s), what="suggestion")
+        except ApplyRefused as exc:
+            return {"id": s["id"], "ok": False, "status": s["status"], "why": str(exc)}
+        from .attest import receipt_digest
         ok = cat.update_suggestion(s["id"], expect_status="pending-card", status="approved",
                                    card_id=cid, approved_at=_now_iso(),
-                                   resolved_by=f"card:{cid}", why=f"approved by card {cid}")
+                                   resolved_by=f"card:{cid}", why=f"approved by card {cid}",
+                                   card_snapshot=_card_dict(card),
+                                   receipt_digest=receipt_digest(
+                                       manage._get(card, "answer_receipt")["receipt"]))
         return {"id": s["id"], "ok": ok, "status": "approved" if ok else s["status"],
                 "why": f"approved by card {cid}" if ok else "changed concurrently"}
     finally:
         if own:
             cat.close()
+
+
+_CARD_FIELDS = ("id", "card_id", "status", "answer", "answered_via", "via", "answered_by",
+                "answered_at", "created_at", "deadline", "facts", "answer_receipt", "title")
+
+
+def _card_dict(card: Any) -> dict:
+    """A JSON-safe copy of the verified card (a dict, or a DecisionCard object)."""
+    import json
+
+    if isinstance(card, Mapping):
+        d = dict(card)
+    else:
+        d = {k: getattr(card, k) for k in _CARD_FIELDS if getattr(card, k, None) is not None}
+    return json.loads(json.dumps(d, sort_keys=True, default=str))
+
+
+def _approval_refusal(cat, s: Mapping[str, Any]) -> str | None:
+    """None when an ``approved`` row still carries an owner approval that VERIFIES now;
+    else why not. Never trusts ``status``, ``card_id`` or ``receipt_digest`` alone: the
+    card must pass ``manage.verify_card`` (signature, owner, fresh sign-in, receipt age,
+    nonce) and bind this row's content."""
+    from . import manage
+    from .attest import receipt_digest
+
+    sid = int(s["id"])
+    cid = str(s.get("card_id") or "")
+    if not cid:
+        return "status says approved but no approving card is recorded"
+    want = str(s.get("receipt_digest") or "")
+    if not want:
+        return "status says approved but no receipt digest was recorded when it was resolved"
+    if s.get("card_raised") and str(s["card_raised"]) != cid:
+        return f"card {cid} is not the card raised for it ({s['card_raised']})"
+    card: Any = None
+    if _card_reader is not None:
+        try:
+            card = _card_reader(cid)
+        except Exception as exc:  # noqa: BLE001 -- unreadable = unverifiable
+            return f"card {cid} unreadable: {type(exc).__name__}: {exc}"
+    if card is None:
+        card = s.get("card_snapshot")
+    if not card:
+        return f"card {cid} is not available to re-verify"
+    try:
+        got = manage.verify_card(card, sid, catalog=cat)
+        if got != cid:
+            return f"card {got} is not the recorded approving card {cid}"
+        manage.require_content(card, suggestion_content_digest(s), what="suggestion")
+        env = manage._get(card, "answer_receipt")
+        if receipt_digest(env["receipt"]) != want:
+            return f"card {cid} carries a different receipt than the one recorded at approval"
+    except ApplyRefused as exc:
+        return str(exc)
+    except (KeyError, TypeError) as exc:
+        return f"card {cid} malformed: {type(exc).__name__}"
+    return None
 
 
 def revert_suggestion(id: int, *, catalog: Any = None) -> dict:
@@ -709,6 +887,7 @@ def apply_suggestions(*, dry_run: bool = True, harvest_to: Any = None, catalog: 
         "bytes_freed": 0, "bytes_quarantined": 0, "bytes_harvested": 0,
         "files_harvested": 0, "drifted": 0, "demoted": 0, "harvest_skipped": [],
         "busy": [], "expired": 0, "reverts_detected": 0, "purged": [], "errors": [],
+        "refused": 0,
         "warnings": [], "could_not_judge": [], "harvest_to": str(shelf).replace("\\", "/"),
     }
     cat = None
@@ -810,12 +989,29 @@ def _apply_one(rec: dict, cat, s: dict, *, now: float, write: bool, shelf: Path,
                                   outcome="drifted", why=why[:1000])
         ledger("drifted", detail=why)
 
+    # An approval is re-verified, never read off the row (catalog.db is editable).
+    if s["status"] == "approved":
+        why = _approval_refusal(cat, s)
+        if why:
+            row.update(outcome="refused", reason=f"approval does not verify: {why}")
+            rec["refused"] += 1
+            rec["errors"].append(f"#{sid} {item}: approval does not verify: {why}")
+            if write:
+                cat.update_suggestion(sid, expect_status="approved", status="refused",
+                                      outcome="refused",
+                                      why=f"approval does not verify at apply: {why}"[:1000])
+            ledger("refused", detail=f"approval does not verify: {why}")
+            return
     # An auto approval is only as good as the trust it was granted on.
     if s["status"] == "auto-approved":
         tr = _agent_trust(cat, s["suggested_by"])
-        if tr < thr or action != "quarantine" or s.get("cls") not in REGENERABLE_CLASSES:
-            why = f"auto lane withdrawn: trust {tr:.2f} < {thr:.2f}" if tr < thr else \
-                "auto lane withdrawn: not a regenerable quarantine"
+        ident_ok = _identity_holds(s)
+        if not ident_ok or tr < thr or action != "quarantine" \
+                or s.get("cls") not in REGENERABLE_CLASSES:
+            why = (f"auto lane withdrawn: identity {s.get('identity') or 'unverified'}"
+                   if not ident_ok else
+                   f"auto lane withdrawn: trust {tr:.2f} < {thr:.2f}" if tr < thr else
+                   "auto lane withdrawn: not a regenerable quarantine")
             row.update(outcome="demoted", reason=why)
             rec["demoted"] += 1
             if write:
@@ -831,6 +1027,10 @@ def _apply_one(rec: dict, cat, s: dict, *, now: float, write: bool, shelf: Path,
         return drifted(f"class is now {v['cls']}, not regenerable")
     if s["status"] == "auto-approved" and not v["nested_ok"]:
         return drifted(f"nested work tree: {v['nested_why']}")
+    if s["status"] == "auto-approved":
+        ev, ev_detail = _verify_evidence(s.get("evidence"), v, now)
+        if ev != "verified":
+            return drifted(f"evidence no longer verifies ({ev}: {ev_detail})")
     d = _drift(s, v)
     if d:
         return drifted(d)
@@ -922,15 +1122,20 @@ __all__ = [
     "OPEN_STATUSES",
     "REGENERABLE_CLASSES",
     "SUGGEST_ACTIONS",
+    "TRUST_INPROCESS_ENV",
     "TRUST_THRESHOLD",
     "apply_suggestions",
     "card_spec",
     "classify_path",
+    "identity_of",
     "resolve_suggestion",
     "revert_suggestion",
     "set_archive_hook",
     "set_card_hook",
+    "set_card_reader",
+    "set_identity_verifier",
     "suggest",
+    "suggestion_content_digest",
     "suggestions",
     "trust",
     "trust_score",

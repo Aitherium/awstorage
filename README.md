@@ -129,6 +129,9 @@ One pass: **expand rules -> measure -> guard -> harvest -> remove -> ledger -> r
   name is registered live, is skipped and reported `skipped-live`. An agent runtime
   registers its session scratch through `AWSTORAGE_LIVE_IDS` (comma/space separated) or
   a `--live-ids` file (one id per line, `#` comments); an id matches the item's basename.
+  An id containing a path separator is a PATH id: it keeps that exact dir, everything
+  under it and every ancestor -- how a runtime marks a session dir with a generic name
+  (`scratchpad`, `tmp`) live without shielding every dir of that name.
   An unreadable `--live-ids` file stops the sweep (exit 2) -- "nobody is live" is never
   a guess.
 - **Harvest first.** Small text files matching the include globs (default `**/*.md`,
@@ -223,13 +226,23 @@ awstorage.apply_suggestions(dry_run=False, harvest_to="E:/AitherOS-Data/harvest"
   presets, but a tree that names itself `dataset`/`repo`/... keeps that class), action
   `quarantine` (never delete, never archive), the evidence verifies (at least one of
   `bytes`, `files`, `idle_hours`, `cls` checked and none contradicted), no nested work
-  tree is dirty or unjudged, and the agent's trust clears the threshold. Everything else
-  is `pending-card`: a decision card is raised through `awstorage.suggest.set_card_hook`
-  (none by default: it waits in `suggestions`). Approving one needs a card that passes
-  `awstorage.manage.verify_card` -- the same owner / surface / attestation checks manage
-  applies -- so while `manage.STORE_ATTESTS_ANSWERER` is False every approval is refused,
-  and it flips only where manage flips it. Rejecting needs no card.
-- **Apply re-verifies.** Re-validation refused, or size / file count / newest mtime moved
+  tree is dirty or unjudged, the agent's IDENTITY is verified (below), and its trust
+  clears the threshold. Everything else is `pending-card`: a decision card is raised
+  through `awstorage.suggest.set_card_hook` (none by default: it waits in
+  `suggestions`). Approving one needs a card that passes `awstorage.manage.verify_card`
+  -- a SIGNED answer receipt (see "Signed answer receipts") -- the same check manage
+  applies. Rejecting needs no card.
+- **Apply trusts no status.** `catalog.db` is a file any local process can edit, so an
+  `approved` row is re-verified: the card recorded at resolve (or the live card through
+  `set_card_reader(fn)`) must pass `manage.verify_card` again, be the card the row
+  names, carry the receipt whose digest was recorded at resolve, and carry a
+  `content_sha256` fact equal to the digest of the row as it stands now (path, action,
+  node, class, size, ...). An `auto-approved` row re-judges every lane condition from
+  disk and the verifier (class re-classified, quarantine only, evidence re-checked,
+  identity re-verified against the proof stored at suggest time -- so a proof must be
+  JSON-serialisable -- and trust). Anything that does not verify is `refused`; a
+  status alone never deletes.
+- **Apply re-validates.** Re-validation refused, or size / file count / newest mtime moved
   since the suggestion -> `drifted`, nothing touched. An auto approval whose agent's
   trust has since fallen goes back to `pending-card`. Then harvest first (the sweep's
   verified harvest), then a quarantine under `<parent>/.awstorage-quarantine/suggest-<id>-*`
@@ -240,9 +253,71 @@ awstorage.apply_suggestions(dry_run=False, harvest_to="E:/AitherOS-Data/harvest"
   `trust = (applied - 3*reverted + 1) / (applied + rejected + 2)` (Laplace-smoothed).
   A new agent scores 0.50, under the default threshold 0.6 (`AWSTORAGE_TRUST_THRESHOLD`,
   clamped to at least 0.51), so its first suggestions go to cards; one revert of an
-  applied suggestion costs three applications. `suggested_by` is declared by the caller:
-  a transport that authenticates agents (MCP, awdk) must stamp it from the
-  authenticated identity.
+  applied suggestion costs three applications.
+- **Identity (0.4.1).** `suggested_by` is declared by the caller and every caller is
+  in-process, so the brick cannot tell an agent from something typing its name. The
+  auto lane therefore needs a VERIFIED identity: a verifier installed with
+  `awstorage.set_identity_verifier(fn)` (`fn(suggested_by, proof) -> True`) accepted the
+  `identity_proof` passed to `suggest`. Without one every suggestion records
+  `identity: unverified` and goes to a card, whatever its trust. The owner may opt in
+  to trusting in-process callers with `AWSTORAGE_TRUST_INPROCESS=1` (recorded as
+  `inprocess-trusted` and re-checked at apply: unset it and those approvals are
+  withdrawn). Transports stamp what they know -- AitherOS MCP `mcp-session:<uid>`,
+  awdk `agent:<name>` -- neither is proof.
+
+## Signed answer receipts (0.4.1)
+
+A decision card's `answered_by`, `answered_via` and `answer_attested` live in files an
+agent on the same host can edit, so none of them approves anything. The platform's
+answering surface signs a receipt with an Ed25519 key that exists only in its vault and
+stores it on the card as `answer_receipt` (`{alg, kid, receipt, sig}`; the receipt is
+`{v, card_id, choice, answered_by, answered_at, nonce, surface, auth_method, auth_time,
+facts_sha256}`). `awstorage.attest.verify_receipt` -- called by `manage.verify_card` and
+so by manage apply, node orders and suggestion approvals -- refuses unless:
+
+- awseal is installed (`pip install awstorage[attest]`; it carries the verifier) and a
+  public key is provisioned in a FILE: `AWSTORAGE_ATTEST_PUBKEY_FILE=<path>`
+  (`AWSTORAGE_ATTEST_PUBKEY` is accepted as a path too; a raw 64-hex key in either env
+  var is REFUSED -- whoever starts the verifier sets its env). The FILE must be provisioned by root / the
+  owner OUTSIDE `~/.aither` (e.g. `/etc/aither/attest.pub`, or a `%ProgramData%` path
+  whose ACL agents cannot write): a path under `~/.aither`, or (POSIX) a world-writable
+  file or directory, is refused -- whoever can swap the key can sign approvals;
+- the signature verifies, and the receipt names this card, this answer and this card's
+  facts (a fact edited after the answer is refused);
+- `auth_method` is `webauthn` or `totp_2fa` and the sign-in was at most 15 min before
+  the answer (`AWSTORAGE_ATTEST_MAX_AUTH_AGE_S`, clamped 60..3600) -- password, device
+  flow (every agent bearer), PAT, API key, OIDC access token, magic link and internal
+  mints never count;
+- `answered_by` is an owner principal (`AWSTORAGE_MANAGE_OWNERS`);
+- `answered_at` is inside the card's window and within 5 min of the store's own;
+- the receipt is at most 7 days old by the REAL clock
+  (`AWSTORAGE_ATTEST_MAX_RECEIPT_AGE_S`, clamped 1 h..30 d; `verify_receipt(now=)` is
+  ignored -- an injectable clock is an injectable bypass);
+- the nonce is new: the catalog table `attest_nonces` binds each nonce to one card and
+  each card to one receipt (re-verifying the SAME receipt is fine).
+
+Every card also carries `content_sha256: <hex>` -- the digest of WHAT is approved
+(manage: node, action, path, bytes, tenant, owner, params and every member's path +
+sha256 + bytes; suggestions: see above). `manage._authorize` and suggestion
+resolve/apply recompute it from the row and refuse a mismatch or a card without it.
+
+`manage.STORE_ATTESTS_ANSWERER` is now only the master switch (True; False refuses
+every answer). A card without a valid receipt is refused either way.
+
+### Threat model -- what an approval does and does not prove
+
+On a single-user host agents run as the owner's OS user. They can delete files
+directly, read the browser's localStorage session and, with `podman exec`, service
+state. A verified receipt therefore proves **"an owner passkey/TOTP session existed
+within 15 minutes of this answer"** -- not "the owner saw this card and chose this".
+Approvals are a **governance gate and a tamper-evident audit trail for agents that use
+the tools**, NOT a security boundary against a hostile local agent. That boundary needs
+OS isolation: agents under a separate OS user, or in a container without podman or
+vault access, and the verifier key provisioned where they cannot write it.
+
+Follow-up that closes the remaining gap (review 2, a2/c3): a per-answer WebAuthn
+step-up whose assertion signs the digest of the RENDERED card, verified here instead of
+(or beside) the session-age check.
 
 ## Keep drives above their floors
 

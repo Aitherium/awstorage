@@ -1,7 +1,7 @@
 """awstorage.manage contract tests (contract A6/A7, review round 1).
 
-Every card action is dry-run by default, refuses without a HUMAN card carrying the
-fact `proposal_id: <id>`, is platform-nodes-only, re-verifies every member (size,
+Every card action is dry-run by default, refuses without an OWNER card carrying the
+fact `proposal_id: <id>` and a SIGNED answer receipt (awstorage.attest), is platform-nodes-only, re-verifies every member (size,
 mtime, sha256 -- keeper AND victim for a hardlink), refuses the guards and any git
 tree up to the filesystem root whatever the card says, quarantines with ONE
 same-volume os.replace (no copy fallback), is revertible byte-for-byte, and writes
@@ -22,28 +22,48 @@ from awstorage import manage, policy
 from awstorage.catalog import Catalog
 from awstorage.policy import ApplyRefused
 
+from tests.attest_util import pubkey_env, sign_card
+
 
 def _sha(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
 OWNER = "owner@test"
+#: The catalog of the running test (set by the `env` fixture), so `_card` can raise
+#: the REAL card facts -- including `content_sha256` -- for a submitted proposal.
+_ENV_CAT: list = []
 
 
-def _card(pid: int, **over) -> dict:
+def _facts(pid: int) -> list[str]:
+    if _ENV_CAT:
+        try:
+            with manage.ManageStore(_ENV_CAT[0]) as st:
+                return manage.card_spec(st.load(pid))["facts"]
+        except Exception:  # noqa: BLE001 -- not a submitted proposal: the bare id fact
+            pass
+    return manage.card_facts(pid)
+
+
+def _card(pid: int, _r: dict | None = None, _sign: bool = True, **over) -> dict:
+    """An owner's answered card, SIGNED as it stands; ``over`` then tampers with the
+    card (after signing) and ``_r`` changes what was signed."""
     card = {"id": f"d-{pid}", "title": f"awstorage #{pid}: dedup?", "status": "answered",
-            "answer": "approve", "answered_via": "popup", "answered_by": OWNER,
-            "facts": manage.card_facts(pid)}
+            "answer": "approve", "answered_via": "desk", "answered_by": OWNER,
+            "facts": _facts(pid)}
+    if _sign:
+        sign_card(card, **(_r or {}))
     card.update(over)
     return card
 
 
 @pytest.fixture(autouse=True)
-def attested_store(monkeypatch):
-    """Model the decisions store AFTER it attests the answerer, with one owner. The
-    shipped default (no attestation) is pinned by test_every_answer_refused_today."""
-    monkeypatch.setattr(manage, "STORE_ATTESTS_ANSWERER", True)
+def attested_store(monkeypatch, tmp_path):
+    """One owner, the test signing key provisioned, and a throwaway default catalog
+    (the nonce store for calls that pass none)."""
     monkeypatch.setenv(manage.OWNERS_ENV, OWNER)
+    monkeypatch.setenv("AWSTORAGE_CATALOG", str(tmp_path / "default-catalog.db"))
+    pubkey_env(monkeypatch)
 
 
 @pytest.fixture
@@ -51,7 +71,9 @@ def env(tmp_path: Path):
     root = tmp_path / "root"
     root.mkdir()
     cat = Catalog(tmp_path / "cat.db")
+    _ENV_CAT[:] = [cat]
     yield root, cat
+    _ENV_CAT.clear()
     cat.close()
 
 
@@ -170,14 +192,13 @@ def test_proposal_shape_round_trips(env):
     {"answer": "reject"},
     {"answered_via": "agent"},
     {"answered_via": "deadline"},
-    # `via` is caller-chosen on every answer route: only the owner-attended
-    # allowlist counts, never api/mcp/cli/portal
-    {"answered_via": "api"},
-    {"answered_via": "mcp"},
-    {"answered_via": "cli"},
-    {"answered_via": "portal"},
-    {"answered_by": None},          # the store recorded no answerer
-    {"answered_by": "atlas"},       # an answerer who is not an owner principal
+    {"answer_receipt": None},       # no signed receipt: the store's word is not proof
+    {"answer_attested": True, "answer_receipt": None},   # a hand-edited boolean
+    {"_r": {"answered_by": "atlas"}},        # SIGNED answerer is not an owner
+    {"_r": {"auth_method": "device_code"}},  # the agent session-bearer's sign-in
+    {"_r": {"auth_method": "password"}},
+    {"_r": {"auth_method": ""}},             # PAT / API key / OIDC access token
+    {"_r": {"choice": "reject"}},            # the owner said reject; the card says approve
     {"id": "d-other"},              # not the card that approved this proposal
     {"facts": ["proposal_id: 999"]},
     {"facts": []},  # the title alone names the id: not enough (A7 needs the fact)
@@ -194,16 +215,24 @@ def test_refuses_without_a_human_approve_of_this_proposal(env, bad):
     assert not (root / ".awstorage-quarantine").exists()
 
 
-def test_every_answer_refused_today(env, monkeypatch):
-    """Shipped default: the decisions store does not attest who answered, so even a
-    perfect owner/popup card is refused -- fail closed until it does."""
+def test_master_switch_off_refuses_a_signed_card(env, monkeypatch):
+    """STORE_ATTESTS_ANSWERER is the master switch: False refuses even a perfectly
+    signed owner card."""
     monkeypatch.setattr(manage, "STORE_ATTESTS_ANSWERER", False)
     root, cat = env
     _, group = _dupes(root)
     pid = _one(cat, group)
-    with pytest.raises(ApplyRefused, match="does not attest"):
+    with pytest.raises(ApplyRefused, match="switched off"):
         manage.apply_manage(pid, catalog=cat, roots=[root], card=_card(pid), dry_run=False)
     assert not (root / ".awstorage-quarantine").exists()
+
+
+def test_via_is_a_label_not_a_gate(env):
+    """0.4.1: the surface allowlist is gone -- an `api`-labelled card with a valid
+    signed receipt approves; the same card unsigned does not."""
+    assert manage.verify_card(_card(1, answered_via="api"), 1) == "d-1"
+    with pytest.raises(ApplyRefused, match="no signed answer receipt"):
+        manage.verify_card(_card(2, _sign=False, answered_via="popup"), 2)
 
 
 def test_no_owner_principals_configured_refuses(monkeypatch):
@@ -343,6 +372,7 @@ def test_git_refusal_walks_to_the_filesystem_root(tmp_path, shape):
     for p in paths:
         p.write_bytes(data)
     cat = Catalog(tmp_path / "cat.db")
+    _ENV_CAT[:] = [cat]
     try:
         rows = [_row(p) for p in paths]
         p = manage.ManageProposal(node="n1", action="hardlink", path=str(paths[1]),
@@ -353,6 +383,7 @@ def test_git_refusal_walks_to_the_filesystem_root(tmp_path, shape):
             manage.apply_manage(pid, catalog=cat, roots=[root], card=_card(pid),
                                 dry_run=False)
     finally:
+        _ENV_CAT.clear()
         cat.close()
     assert all(x.read_bytes() == data for x in paths)
 

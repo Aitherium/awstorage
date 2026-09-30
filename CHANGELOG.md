@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.5.1 -- 2026-09-29
+
+The 0.4.1 security work, released on top of 0.5.0 (relocate). Relocate cards
+are approved through the same signed receipt (platform
+`awstorage_card_consumer.relocate_card_decision`), never the card's
+`answered_by` label.
+
+A security review of the first platform wiring found that "the owner approved this"
+rested on fields an agent on the owner's host can write: a boolean `answer_attested`,
+an `answered_by` stamped from any bearer Identity accepts (the agent session-bearer
+included), and a caller-chosen `answered_via`. And a `suggested_by` the brick trusted
+for the auto lane is whatever the in-process caller typed.
+
+### Security
+- **Card approvals need a SIGNED receipt** (`awstorage.attest`, new). Ed25519 over
+  `{card_id, choice, answered_by, answered_at, nonce, surface, auth_method, auth_time,
+  facts_sha256}` with the platform's vault-held key, verified with a provisioned public
+  key (`AWSTORAGE_ATTEST_PUBKEY` / `AWSTORAGE_ATTEST_PUBKEY_FILE`) through awseal
+  (imported guarded; absent -> refuse). Checked: signature, card id, choice, facts
+  digest, interactive sign-in (`webauthn` / `totp_2fa`) at most 15 min old, owner
+  principal, card window, nonce unused (table `attest_nonces`). `manage.card_decision`
+  / `verify_card` gain `catalog=` (nonce store), `pubkey=`; `apply_manage` and
+  `resolve_suggestion` pass their catalog.
+- `manage.STORE_ATTESTS_ANSWERER` is now the master switch and ships **True**; it never
+  makes a card without a valid receipt count. The `HUMAN_VIAS` surface allowlist is no
+  longer consulted (`via` is a label; the signed `surface`/`auth_method` replace it);
+  `NON_HUMAN_VIAS` labels (`agent`, `deadline`, ...) are still refused.
+- **The auto lane needs a verified identity**: `set_identity_verifier(fn)` +
+  `suggest(..., identity_proof=)`; otherwise `identity: unverified` -> card lane.
+  Owner opt-in `AWSTORAGE_TRUST_INPROCESS=1` (`inprocess-trusted`, re-checked at
+  apply). Catalog column `suggestions.identity` (additive; 0.4.0 rows read
+  `unverified`, so their auto approvals are withdrawn at apply).
+- **Path live ids**: a live id containing a path separator keeps that dir, its subtree
+  and its ancestors (`sweep.live_path_hit`), so a runtime can register a generic
+  `scratchpad`/`tmp` dir by full path instead of blocking every dir of that name.
+
+### Security (second review)
+- **Apply trusts no status** (c1). `apply_suggestions` re-verifies an `approved` row:
+  the card recorded at resolve (new columns `card_snapshot`, `receipt_digest`; or the
+  live card via the new `set_card_reader(fn)`) must pass `manage.verify_card` again,
+  be the row's card, carry the receipt digest recorded at resolve and bind the row's
+  content. An `auto-approved` row re-verifies its identity with the installed verifier
+  against the proof stored at suggest time (new column `identity_proof`; a proof must
+  be JSON-serialisable) and re-checks its evidence. Otherwise the row becomes
+  `refused` (receipt `refused` count, exit 1) -- a status flipped in SQLite deletes
+  nothing. Self-test check 18.
+- **Cards bind their content** (c2). New fact `content_sha256: <hex>`
+  (`manage.content_digest`, `suggest.suggestion_content_digest`) over the canonical
+  proposal (members' path + sha256 + bytes, params, node, action, path ...);
+  `manage._authorize` and suggestion resolve/apply recompute and compare; a card
+  without it is refused (re-raise cards raised by earlier 0.4.1 builds).
+- **Receipts expire** (c4): refused when older than 7 days
+  (`AWSTORAGE_ATTEST_MAX_RECEIPT_AGE_S`, clamped 1 h..30 d), always by the real clock;
+  `verify_receipt(now=)` is now ignored.
+- **The verifier key file must be out of agents' reach** (c5):
+  `AWSTORAGE_ATTEST_PUBKEY_FILE` under `~/.aither`, or world-writable (POSIX file,
+  directory, or a non-sticky ancestor), is refused (`attest.pubkey_file_refusal`).
+- Documented the threat model: approvals are a governance gate + audit trail, not a
+  boundary against a hostile agent running as the owner's OS user.
+
+### Security (third review)
+- **The verifier key comes only from a FILE.** A raw 64-hex key in
+  `AWSTORAGE_ATTEST_PUBKEY` skipped the location check (an env var is set by whoever
+  starts the verifier); it is now refused with a message naming the fix. Both
+  `AWSTORAGE_ATTEST_PUBKEY_FILE` and `AWSTORAGE_ATTEST_PUBKEY` take a PATH and both get
+  the ~/.aither / world-writable check. Migration: write the key to a root/owner-owned
+  file and point `AWSTORAGE_ATTEST_PUBKEY_FILE` at it.
+- **One proposal, one content per card.** `manage.card_decision` refuses a card with
+  more than one `proposal_id` fact and `manage.require_content` one with more than one
+  `content_sha256` fact (keys matched case- and space-insensitively), so one signed
+  answer cannot approve two proposals or two contents.
+
+### Added
+- Extra `attest = ["awseal>=0.1.1"]` (also in `dev`); CI installs `.[attest]`.
+- Self-test checks 15-17: an unverified identity never auto-approves; a card with no
+  receipt or a forged one is refused; a path live id keeps a generic dir.
+
 ## 0.5.0 -- 2026-09-28
 
 Measured 2026-09-28: 88 GB moved D: -> C: by hand (robocopy /MOVE + a junction) with

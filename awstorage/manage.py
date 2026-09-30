@@ -20,10 +20,13 @@ Rules every action obeys, each pinned by a test:
 * **CARD-ONLY approval.** An action runs only with a decision card whose answer is
   ``approve``, which carries the fact ``proposal_id: <id>`` for THIS proposal, which
   is the card the consumer recorded as approving it (``card_id``) on a proposal
-  already ``approved``, and which an OWNER answered on an owner-attended surface
-  (``HUMAN_VIAS`` allowlist + a store-attested ``answered_by``). The store does not
-  attest the answerer yet, so today every answer is refused (fail closed). There is
-  no self-service exception.
+  already ``approved``, and which carries a SIGNED answer receipt
+  (``awstorage.attest.verify_receipt``): Ed25519 over {card, choice, answerer,
+  time, nonce, surface, auth method, facts digest} with the platform's attestation
+  key, an interactive fresh sign-in, an owner principal, an unused nonce. No
+  provisioned public key, no awseal, or no receipt -> refused (fail closed). The
+  card's own ``answered_by`` / ``answer_attested`` / ``answered_via`` are labels, not
+  proof. There is no self-service exception.
 * **Platform nodes only.** Until the decisions store carries a ``recipient`` and a
   tenant owner can approve their own node's card, every proposal whose ``tenant``
   is not ``platform`` is refused at apply (contract A7).
@@ -91,25 +94,25 @@ MANAGE_STATUSES = frozenset({"proposed", "approved", "rejected", "expired", "sno
 
 #: `answered_via` values that are NOT a human answering: the agent that raised the
 #: card closing it itself, or the store applying the declared default at deadline.
-#: Kept for callers that name them; the check is the ALLOWLIST below, not this set.
+#: A card labelled with one of these is refused even with a receipt (belt and
+#: braces: such an answer never carries a genuine one).
 NON_HUMAN_VIAS = frozenset({"agent", "deadline", "timeout", "expired", "steerback", ""})
 
-#: The ONLY `answered_via` values that can count as the owner answering: surfaces an
-#: owner attends (the desktop popup, the desk, the phone channel). `api`, `mcp`,
-#: `cli`, `portal` and anything else are refused. `via` is caller-chosen on every
-#: answer route today, so it is a filter, never proof on its own.
+#: 0.4.0's surface ALLOWLIST. No longer consulted (0.4.1): `via` is a caller-chosen
+#: label; the SIGNED receipt's `surface` + `auth_method` replace it. Kept so imports
+#: of the name keep working.
 HUMAN_VIAS = frozenset({"popup", "desk", "phone"})
 
 #: Env var naming the owner principals (comma-separated user ids) whose answer may
 #: approve a manage proposal. Unset -> nobody's answer approves anything.
 OWNERS_ENV = "AWSTORAGE_MANAGE_OWNERS"
 
-#: Whether the decision store stamps `answered_by` from the AUTHENTICATED answering
-#: surface (never from the answer body). It does not yet: the adk store records no
-#: answerer, and Genesis/MCP/CLI pass `via` straight from the caller. Until that
-#: lands (handoff: decisions store), every answer is refused -- fail closed. Flip it
-#: only in the change that makes the store attest the answerer.
-STORE_ATTESTS_ANSWERER = False
+#: MASTER SWITCH for card approvals. False refuses every answer. True (0.4.1) is NOT
+#: trust in the store: every answer must still carry a receipt that
+#: ``attest.verify_receipt`` accepts -- signature with the provisioned platform key,
+#: owner principal, fresh interactive sign-in, unused nonce. The store's own fields
+#: (``answered_by``, ``answer_attested``) are never an attestation path.
+STORE_ATTESTS_ANSWERER = True
 
 _SIDE_DDL = """
 CREATE TABLE IF NOT EXISTS manage_params (
@@ -642,6 +645,57 @@ def card_facts(proposal_id: int) -> list[str]:
     return [f"proposal_id: {int(proposal_id)}"]
 
 
+#: The card fact naming WHAT was approved: ``content_sha256: <hex>``. The receipt signs
+#: the card's facts, so a row edited after the card (another path, other members,
+#: other params) no longer matches the digest the owner's answer is bound to.
+CONTENT_FACT = "content_sha256"
+
+
+def _canon_digest(obj: Any) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False, default=str).encode("utf-8")
+                          ).hexdigest()
+
+
+def content_digest(p: "ManageProposal") -> str:
+    """sha256 of the canonical content of a manage proposal: id, node, action, path,
+    bytes, tenant, owner, params, and every member's path + sha256 + bytes (sorted)."""
+    members = sorted(({"path": str(m.get("path")), "sha256": m.get("sha256") or None,
+                       "bytes": int(m.get("bytes") or 0)} for m in (p.members or [])),
+                     key=lambda m: (m["path"], str(m["sha256"])))
+    return _canon_digest({"v": 1, "kind": "manage", "id": p.id, "node": p.node,
+                          "action": p.action, "path": str(p.path), "bytes": int(p.bytes or 0),
+                          "tenant": p.tenant or PLATFORM_TENANT, "owner": p.owner,
+                          "params": p.params or {}, "members": members})
+
+
+def content_fact(digest: str) -> str:
+    return f"{CONTENT_FACT}: {digest}"
+
+
+def _fact_key(fact: str) -> str:
+    """``'proposal_id'`` for ``'Proposal_ID : 7'`` -- the key a fact line names."""
+    return fact.split(":", 1)[0].strip().lower() if ":" in fact else ""
+
+
+def require_content(card: Any, digest: str, *, what: str = "proposal") -> None:
+    """Refuse unless the (already receipt-verified) card carries ``content_sha256`` equal
+    to ``digest`` -- the content being acted on NOW, recomputed from the row."""
+    facts = [re.sub(r"\s+", " ", str(f)).strip() for f in (_get(card, "facts") or [])]
+    cid = str(_get(card, "id") or _get(card, "card_id") or "?")
+    named = [f for f in facts if _fact_key(f) == CONTENT_FACT]
+    if not named:
+        raise ApplyRefused(f"card {cid} carries no '{CONTENT_FACT}' fact: it does not say "
+                           f"WHAT was approved; re-raise the card")
+    if len(named) != 1:
+        raise ApplyRefused(f"card {cid} carries {len(named)} '{CONTENT_FACT}' facts: an "
+                           "answer must approve exactly one content; re-raise the card")
+    if named[0] != content_fact(digest):
+        raise ApplyRefused(f"card {cid}: the {what} changed after the owner answered "
+                           f"(content digest {digest[:12]} is not the approved "
+                           f"{named[0].split(':', 1)[1].strip()[:12]})")
+
+
 def card_spec(p: ManageProposal) -> dict:
     """Title, summary, facts, options and reversibility text for the card that asks a
     human to approve `p`. Every card action has its own text (pinned per action)."""
@@ -651,7 +705,8 @@ def card_spec(p: ManageProposal) -> dict:
     keep = (p.params.get("keep") or {}).get("path", "")
     facts = card_facts(p.id) + [f"node: {p.node}", f"action: {p.action}",
                                 f"members: {len(p.members)}", f"bytes: {p.bytes}",
-                                f"expires: {p.expires_at}"]
+                                f"expires: {p.expires_at}",
+                                content_fact(content_digest(p))]
     if p.action == "hardlink":
         title = f"awstorage #{p.id}: hardlink {len(p.members)} duplicate(s) on {p.node}?"
         summary = (f"Replace {len(p.members)} byte-identical copies ({gb:.2f} GB) with "
@@ -705,18 +760,34 @@ def owner_principals() -> frozenset:
     return frozenset(x.strip() for x in raw.split(",") if x.strip())
 
 
+def _nonce_store(catalog: Any) -> Any:
+    """The catalog that records receipt nonces: the caller's, else the default one."""
+    if catalog is not None:
+        return catalog
+    from .suggest import default_catalog_path  # noqa: PLC0415
+
+    return default_catalog_path()
+
+
 def card_decision(card: Any, proposal_id: int, *,
-                  owners: Optional[Iterable[str]] = None) -> tuple[str, str]:
+                  owners: Optional[Iterable[str]] = None, catalog: Any = None,
+                  pubkey: Optional[str] = None, record_nonce: bool = True
+                  ) -> tuple[str, str]:
     """(card id, 'approve'|'reject') for an OWNER answer naming THIS proposal; else refuse.
 
     The card is an `adk.decisions` DecisionCard (object or dict) read from the
-    decision record. It must carry the exact fact ``proposal_id: <id>`` -- a title
-    that merely starts with the id is not enough -- it must have been answered via
-    an owner-attended surface (``HUMAN_VIAS``, an allowlist), and its
-    ``answered_by`` must be an owner principal stamped by a store that attests the
-    answerer (``STORE_ATTESTS_ANSWERER``). Until the store attests it, every answer
-    is refused.
+    decision record. It must be answered, carry the exact fact
+    ``proposal_id: <id>`` -- a title that merely starts with the id is not enough --
+    and carry a SIGNED answer receipt that :func:`awstorage.attest.verify_receipt`
+    accepts: the platform's Ed25519 signature (public key from
+    the file named by ``$AWSTORAGE_ATTEST_PUBKEY_FILE`` or ``pubkey``)
+    over this card id, this answer, these facts, an owner principal and a fresh
+    interactive sign-in, with a nonce not seen on another card (recorded in
+    ``catalog``; the default catalog when None). ``answered_by``/``answer_attested``
+    on the card are never read as proof. ``STORE_ATTESTS_ANSWERER`` False refuses all.
     """
+    from . import attest  # noqa: PLC0415
+
     if card is None:
         raise ApplyRefused("no decision card: manage actions are CARD-ONLY")
     cid = str(_get(card, "id") or _get(card, "card_id") or "")
@@ -724,31 +795,40 @@ def card_decision(card: Any, proposal_id: int, *,
     if status != "answered":
         raise ApplyRefused(f"card {cid or '?'} is {status or 'unanswered'!s}, not answered")
     via = str(_get(card, "answered_via") or _get(card, "via") or "").strip().lower()
-    if via not in HUMAN_VIAS:
-        raise ApplyRefused(f"card {cid or '?'} was answered via {via or 'unknown'!r}; "
-                           f"only an owner-attended surface counts {sorted(HUMAN_VIAS)}")
+    if via in NON_HUMAN_VIAS - {""}:
+        raise ApplyRefused(f"card {cid or '?'} was answered via {via!r}, which is never "
+                           "a human")
     if not STORE_ATTESTS_ANSWERER:
-        raise ApplyRefused(f"card {cid or '?'}: the decision store does not attest who "
-                           "answered (no store-stamped answered_by); every answer is "
-                           "refused until it does")
-    who = str(_get(card, "answered_by") or "").strip()
-    allowed = frozenset(owners) if owners is not None else owner_principals()
-    if not who or who not in allowed:
-        raise ApplyRefused(f"card {cid or '?'} was answered by {who or 'nobody recorded'!r}, "
-                           f"not an owner principal (${OWNERS_ENV})")
+        raise ApplyRefused(f"card {cid or '?'}: card approvals are switched off "
+                           "(STORE_ATTESTS_ANSWERER is False); every answer is refused")
     facts = [re.sub(r"\s+", " ", str(f)).strip() for f in (_get(card, "facts") or [])]
-    if f"proposal_id: {int(proposal_id)}" not in facts:
+    named = [f for f in facts if _fact_key(f) == "proposal_id"]
+    if len(named) > 1:
+        raise ApplyRefused(f"card {cid or '?'} carries {len(named)} 'proposal_id' facts: an "
+                           "answer must name exactly one proposal")
+    if named != [f"proposal_id: {int(proposal_id)}"]:
         raise ApplyRefused(f"card {cid or '?'} does not carry the fact "
                            f"'proposal_id: {int(proposal_id)}'")
     answer = str(_get(card, "answer") or "").strip().lower()
     if answer not in ("approve", "reject"):
         raise ApplyRefused(f"card {cid or '?'} was answered {answer or 'nothing'!r}")
+    allowed = frozenset(owners) if owners is not None else owner_principals()
+    if not allowed:
+        raise ApplyRefused(f"card {cid or '?'}: no owner principal configured "
+                           f"(${OWNERS_ENV}); nobody's answer approves anything")
+    attest.verify_receipt(card, owners=allowed, pubkey=pubkey,
+                          nonce_store=_nonce_store(catalog) if record_nonce else None,
+                          record=record_nonce)
     return cid, answer
 
 
-def verify_card(card: Any, proposal_id: int) -> str:
-    """Return the card id if `card` is a HUMAN `approve` of THIS proposal; else refuse."""
-    cid, answer = card_decision(card, proposal_id)
+def verify_card(card: Any, proposal_id: int, *, catalog: Any = None,
+                owners: Optional[Iterable[str]] = None,
+                pubkey: Optional[str] = None) -> str:
+    """Return the card id if `card` is a SIGNED owner `approve` of THIS proposal; else
+    refuse. See :func:`card_decision`."""
+    cid, answer = card_decision(card, proposal_id, owners=owners, catalog=catalog,
+                                pubkey=pubkey)
     if answer != "approve":
         raise ApplyRefused(f"card {cid or '?'} was answered {answer!r}, not approve")
     return cid
@@ -847,7 +927,7 @@ def _expired(p: ManageProposal) -> bool:
     return exp is not None and datetime.now(timezone.utc) >= exp
 
 
-def _authorize(p: ManageProposal, card: Any) -> str:
+def _authorize(p: ManageProposal, card: Any, catalog: Any = None) -> str:
     if p.action not in CARD_ACTIONS:
         raise ApplyRefused(f"unknown manage action {p.action!r}")
     if (p.tenant or PLATFORM_TENANT) != PLATFORM_TENANT or p.node == WORKSPACE_NODE:
@@ -865,10 +945,11 @@ def _authorize(p: ManageProposal, card: Any) -> str:
         raise ApplyRefused(f"proposal {p.id} records no approving card")
     if _expired(p):
         raise ApplyRefused(f"proposal {p.id} expired at {p.expires_at}; re-propose")
-    cid = verify_card(card, p.id)
+    cid = verify_card(card, p.id, catalog=catalog)
     if cid != str(p.card_id):
         raise ApplyRefused(f"card {cid or '?'} is not the card that approved proposal "
                            f"{p.id} ({p.card_id})")
+    require_content(card, content_digest(p))
     return "card:" + cid
 
 
@@ -953,7 +1034,7 @@ def _apply(p: ManageProposal, store: ManageStore, roots: list[Path], card: Any,
            dry_run: bool, strata_hook: Optional[StrataHook],
            readback_hook: Optional[ReadbackHook],
            share_hook: Optional[ShareHook]) -> dict:
-    authority = _authorize(p, card)
+    authority = _authorize(p, card, store.catalog)
     if p.action in ("hardlink", "quarantine-copy"):
         return _apply_dedup(p, store, roots, dry_run, authority)
     if p.action == "archive":
