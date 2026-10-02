@@ -1,10 +1,11 @@
 """node_run.py -- the loop every node runs.
 
-Four steps, in order, every pass:
+The steps, in order, every pass:
 
     fetch orders (GET /requests/{node_id}, via storage_requests)
         -> apply the ones a human approved (awstorage.apply, dry_run=False)
         -> report what happened (POST /ledger/{node_id}, via storage_report_apply)
+        -> hash what a `{kind: 'hash', paths}` order names, push the index delta (A3)
         -> scan the declared roots + run the configured collectors
         -> push what was found (POST /scans/{node_id}, via storage_ingest_scan)
 
@@ -48,6 +49,7 @@ from .remote import (
     GatewayError,
     fetch_manage_order,
     fetch_requests,
+    push_files,
     push_snapshot,
     report_apply,
     report_manage,
@@ -167,8 +169,8 @@ def apply_orders(orders: list[dict], *, roots: list, run=subprocess.run,
     hook = (lambda p: _engine_prune_hook(p, run=run)) if podman_available() else None
     rows: list[dict] = []
     for row in orders:
-        if row.get("status") != "approved":
-            continue
+        if row.get("kind") == "hash" or row.get("status") != "approved":
+            continue  # hash orders run in run_hash_orders; unapproved never runs
         order = {**row, "action": normalize_action(str(row.get("action", "")))}
         handler = DISPATCH.get(order["action"])
         try:
@@ -180,6 +182,32 @@ def apply_orders(orders: list[dict], *, roots: list, run=subprocess.run,
         except Exception as exc:  # noqa: BLE001 -- every failure is a ledger row
             rows.append(_row_of(order, "failed", f"{type(exc).__name__}: {exc}"[:500]))
     return rows
+
+
+def run_hash_orders(client: GatewayClient, node_id: str, orders: list[dict], *,
+                    index: Optional[Path] = None, time_budget_s: float = 1800.0,
+                    push: Optional[Callable[..., dict]] = None) -> dict:
+    """A3: carry out Genesis `{kind: 'hash', paths}` orders -- full-sha256 exactly
+    those paths in this node's local files index, then push the index delta so the
+    fleet's duplicate groups cover the confirmed hashes. Only paths the local index
+    already holds are read (an order never widens what this node hashes beyond its own
+    indexed roots). Raises GatewayError when the push is refused."""
+    from . import files as awfiles  # noqa: PLC0415
+
+    paths: list[str] = []
+    for o in orders:
+        if o.get("node") not in (None, node_id):
+            continue  # an order for another node is never executed here
+        paths += [p for p in (o.get("paths") or []) if isinstance(p, str)]
+    db = awfiles.open_index(index or awfiles.default_index_path())
+    try:
+        st = awfiles.hash_paths(db, node_id, paths, time_budget_s=time_budget_s)
+        st["pushed"] = None
+        if st["hashed"]:
+            st["pushed"] = (push or push_files)(client, db, node_id)
+    finally:
+        db.close()
+    return st
 
 
 def default_manage_context(client: GatewayClient, node_id: str,
@@ -247,6 +275,13 @@ def run_once(client: GatewayClient, *, node_id: str, roots: Iterable, depth: int
                 summary["manage_reported"] = report_manage(client, node_id, card_rows)
             except GatewayError as exc:
                 summary["errors"].append(f"report_manage: {exc}")
+
+    hash_orders = [o for o in orders if isinstance(o, dict) and o.get("kind") == "hash"]
+    if hash_orders:
+        try:
+            summary["hash_orders"] = run_hash_orders(client, node_id, hash_orders)
+        except (GatewayError, OSError, ValueError) as exc:
+            summary["errors"].append(f"hash_orders: {type(exc).__name__}: {exc}")
 
     if orders_only:
         if summary["errors"]:

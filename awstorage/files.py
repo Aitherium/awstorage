@@ -852,6 +852,96 @@ def _update_root_hash_pct(db: sqlite3.Connection, tenant: str, node: str, root: 
                (round(100.0 * h / n, 1) if n else None, tenant, node, root))
 
 
+# ---------------------------------------------------------------------------
+# cross-node hash orders (A3): a size collision ACROSS nodes is invisible to one
+# node's own `hash_node` (its size buckets are per node), so Genesis -- the only
+# place that sees every node -- names the paths each node must hash, and the node
+# hashes exactly those and pushes. `dupes()` without a node then covers them.
+# ---------------------------------------------------------------------------
+
+HASH_ORDER_MAX = 10_000   # paths per hash order (per node, per /requests read)
+
+
+def hash_orders(db: sqlite3.Connection, node: str, *, tenant: str = PLATFORM_TENANT,
+                min_bytes: int = DEFAULT_MIN_HASH_BYTES,
+                limit: int = HASH_ORDER_MAX) -> list[str]:
+    """Paths on `node` that carry no sha256 and whose size equals a file's on ANOTHER
+    node of the same tenant -- the candidates only a cross-node view can see. Largest
+    first (most bytes a confirmed duplicate could reclaim), capped at `limit` (at most
+    HASH_ORDER_MAX). `never` rows are excluded: they are never hashed."""
+    limit = max(0, min(int(limit), HASH_ORDER_MAX))
+    if not limit:
+        return []
+    return [r[0] for r in db.execute(
+        "SELECT path FROM files WHERE tenant = ? AND node = ? AND sha256 IS NULL"
+        " AND never = 0 AND bytes >= ? AND bytes IN (SELECT bytes FROM files"
+        " WHERE tenant = ? AND node <> ? AND bytes >= ?)"
+        " ORDER BY bytes DESC, path LIMIT ?",
+        (tenant, node, int(min_bytes), tenant, node, int(min_bytes), limit))]
+
+
+def hash_paths(db: sqlite3.Connection, node: str, paths: Iterable[str], *,
+               tenant: str = PLATFORM_TENANT, time_budget_s: float = 3600.0,
+               budget_bytes: int = DEFAULT_HASH_BUDGET_BYTES,
+               workers: int = HASH_WORKERS) -> dict:
+    """Full-sha256 exactly `paths` (a Genesis hash order) where the local index holds
+    them unhashed. A path not indexed here, already hashed, in the no-hash set, or
+    changed since it was indexed is counted, never hashed blind. Each hash bumps the
+    row's seq so the next `push_files` delta carries it. Bounded by time AND bytes: the
+    deadline ends the pass, but a file that does not fit the remaining byte budget is
+    only passed over (truncated=True) -- the rows come back in index order, so stopping
+    at one oversized file would starve every path after it on every pass."""
+    want = list(dict.fromkeys(norm_path(p) for p in paths if p))[:HASH_ORDER_MAX]
+    st = {"requested": len(want), "hashed": 0, "already": 0, "missing": 0, "skipped": 0,
+          "errors": 0, "bytes_read": 0, "truncated": False}
+    rows: list[tuple] = []
+    for part in _chunks(want, _IN_CHUNK):
+        rows += db.execute(
+            "SELECT path, bytes, mtime_ns, sha256 FROM files WHERE tenant = ? AND node = ?"
+            " AND path IN (" + ",".join("?" * len(part)) + ")",
+            [tenant, node, *part]).fetchall()
+    st["missing"] = len(want) - len(rows)
+    deadline = time.monotonic() + float(time_budget_s)
+    todo = []
+    for path, size, mtime_ns, sha in rows:
+        if sha:
+            st["already"] += 1
+            continue
+        if _no_hash(path):
+            st["skipped"] += 1
+            continue
+        if time.monotonic() >= deadline:
+            st["truncated"] = True
+            break
+        if st["bytes_read"] + size > budget_bytes:
+            st["truncated"] = True
+            continue
+        st["bytes_read"] += size
+        todo.append((path, size, mtime_ns, True, PARTIAL_BYTES))
+    got, shas = [], set()
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+        for a, r in zip(todo, pool.map(_hash_one, todo)):
+            if r is None or r[0] == "error":
+                st["bytes_read"] -= a[1]
+                st["errors" if r is not None else "skipped"] += 1
+                continue
+            got.append(r)
+            shas.add(r[4])
+    if got:
+        with db:
+            s = _next_seq(db)
+            db.executemany(
+                "UPDATE files SET sha256 = ?, dev = COALESCE(?, dev), ino = COALESCE(?, ino),"
+                " nlink = COALESCE(?, nlink), seq = ? WHERE tenant = ? AND node = ?"
+                " AND path = ? AND bytes = ? AND mtime_ns = ?",
+                [(r[4], r[5], r[6], r[7], s, tenant, node, r[0], r[1], r[2]) for r in got])
+            _refresh_groups(db, tenant, shas)
+            for r in local_roots(db, node, tenant):
+                _update_root_hash_pct(db, tenant, node, r["root"])
+        st["hashed"] = len(got)
+    return st
+
+
 def scan_files(db: sqlite3.Connection, roots: Iterable[str | os.PathLike], *, node: str,
                tenant: str = PLATFORM_TENANT, hash_mode: str = "auto",
                time_budget_s: float = 3600.0, min_hash_bytes: int = DEFAULT_MIN_HASH_BYTES,
