@@ -30,6 +30,7 @@ import importlib
 import inspect
 import json
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -320,6 +321,16 @@ def land_to_awm(scope: str, manifest: Dict[str, Any], shelf_dir: str,
                        meta={"source": "awstorage", "shelf": shelf_dir, "item": item,
                              "files": len(files)})
     except Exception as exc:  # noqa: BLE001
+        # MEASURED 2026-10-06 (awm 0.6.1): an older-schema file no longer
+        # refuses at MemoryStore(...) -- the store opens lazily and the refusal
+        # now surfaces HERE, as sqlite's "no such table: memories" on the first
+        # write. Same promise as the construction-time path above (a compat
+        # problem, reported and never migrated), moved one call later; both
+        # points classify identically so the README's sentence stays true.
+        if isinstance(exc, sqlite3.OperationalError) and "no such table" in str(exc):
+            return {"available": True, "ok": False,
+                    "reason": f"awm refused {path} (compat: missing table on an "
+                              f"older schema: {exc})"}
         return {"available": True, "ok": False, "reason": f"{type(exc).__name__}: {exc}"}
     finally:
         store.close()
