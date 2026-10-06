@@ -1,0 +1,38 @@
+# awstorage
+
+> Every drive on every node, indexed, classified and diffed -- so you can see what you own before you delete it.
+
+Storage sprawls faster than anyone can look at it. Caches, dead builds, duplicate model weights and orphaned volumes accumulate across drives and nodes, and the only tool is an ad-hoc du that answers one question once and is forgotten. Deleting without an inventory destroys the wrong thing; not deleting fills the disk that holds Postgres.
+
+## Install
+
+```
+pip install awstorage
+```
+
+## Use it in 30 seconds
+
+Scan one drive and read a ranked inventory of what fills it, with each tree marked re-fetchable or not.
+
+## Composes with
+
+- [awrecover](https://aitherium.github.io/awrecover/) — Labelled snapshots with an all-or-nothing restore.
+- [awdk](https://aitherium.github.io/awdk/) — Build AI agent fleets — 3 lines, any backend, local or cloud.
+- [awnode](https://aitherium.github.io/awnode/) — A lightweight local gateway — bridges your apps to the AI backends you chose.
+- [awsh](https://aitherium.github.io/awsh/) — Your terminal answers you -- type a question where a command would go.
+- [awgraph](https://aitherium.github.io/awgraph/) — A semantic code graph for agents — AST + tree-sitter, call graphs.
+- [awdit](https://aitherium.github.io/awdit/) — An append-only audit trail whose gaps are DETECTABLE.
+- [awseal](https://aitherium.github.io/awseal/) — Sign an artifact so a stranger can verify it.
+- [awshare](https://aitherium.github.io/awshare/) — Publish an artifact and fetch it back verified.
+- [awm](https://aitherium.github.io/awm/) — A portable, scoped agent memory.
+- [awrise](https://aitherium.github.io/awrise/) — Wake an agent on a schedule, let it do one thing, and put it back to sleep.
+
+## Where it lives
+
+- Repo: https://github.com/Aitherium/awstorage
+- Docs: https://aitherium.github.io/awstorage/
+- Manifest (keys + the one-line adoption story): https://aitherium.github.io/awstorage/aither-manifest.json
+
+This repository is mirrored from the AitherOS monorepo by `.github/workflows/sync-awstorage.yml`; hand edits made here are overwritten on the next sync — change the source instead.
+
+Everything Aitherium, in one file for agents: https://aitherium.com/llms.txt
