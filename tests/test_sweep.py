@@ -659,13 +659,21 @@ def test_preset_agent_scratch_end_to_end_via_env(tmp_path: Path):
 
 
 def test_python_dash_m_and_version():
-    assert awstorage.__version__ == "0.5.1"
+    # The three version carriers must AGREE -- pyproject is the source. A
+    # literal here made every release bump fail this test until someone
+    # remembered to edit it too (0.5.2, 2026-10-07: green locally before the
+    # bump, red on the mirror's CI after it).
+    import re
+
+    toml = (PKG_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    m = re.search(r'^version = "([^"]+)"', toml, re.M)
+    assert m, "pyproject.toml declares no version"
+    want = m.group(1)
+    assert awstorage.__version__ == want
     r = subprocess.run([sys.executable, "-m", "awstorage", "--version"], cwd=PKG_ROOT,
                        capture_output=True, text=True, encoding="utf-8",
                        errors="replace", timeout=60, check=False)
-    assert r.returncode == 0 and "0.5.1" in r.stdout
-    toml = (PKG_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'version = "0.5.1"' in toml
+    assert r.returncode == 0 and want in r.stdout
 
 
 def test_sweep_imports_no_sibling_at_module_load():
