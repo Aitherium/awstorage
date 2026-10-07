@@ -322,6 +322,21 @@ def test_dupes_never_cross_tenants(db):
     assert db.execute("SELECT COUNT(*) FROM dupe_groups").fetchone()[0] == 0
 
 
+
+def test_push_accepts_folded_windows_file_ids():
+    # A hosted windows runner's file IDs set bit 63; _nz folds them negative and
+    # the wire validator must take them back, or those rows never reach the fleet.
+    ino = F._nz(2 ** 64 - 7)
+    assert ino == -7
+    row = {"path": "D:/x/f.bin", "name": "f.bin", "parent": "D:/x", "bytes": 10,
+           "mtime_ns": 1, "ext": "bin", "mime": None, "partial_hash": None,
+           "sha256": None, "dev": F._nz(2 ** 64 - 1), "ino": ino, "nlink": 1,
+           "git_root": None, "sensitive": 0, "never": 0, "seq": 1}
+    got, err = F.validate_row(row, root="D:/x", to_seq=1, g=Guards())
+    assert err is None and (got["dev"], got["ino"]) == (-1, -7)
+    _, err = F.validate_row({**row, "ino": 2 ** 63}, root="D:/x", to_seq=1, g=Guards())
+    assert err and "out of range" in err
+
 # -- the delta push protocol, end to end --------------------------------------------
 
 class _Loop:

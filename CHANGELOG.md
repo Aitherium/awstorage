@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.3 -- 2026-10-07
+
+Windows file IDs survive the delta push. 0.5.2 folded unsigned 64-bit NTFS/ReFS
+`st_dev`/`st_ino` into SQLite's signed range (two's-complement, so hard-link
+identity is exact), but the push validator still accepted only non-negative
+ints, so every row with a folded id was rejected on ingest. `dev`/`ino` now
+accept the full signed 64-bit range; `nlink` stays non-negative. 0.5.2 also
+made receipt mtime checks tolerate coarse filesystem timestamps in tests.
+
 ## 0.5.1 -- 2026-09-29
 
 The 0.4.1 security work, released on top of 0.5.0 (relocate). Relocate cards

@@ -1113,6 +1113,21 @@ def _opt_int(v: Any) -> int | None | bool:
     return i if 0 <= i < 2 ** 63 else False
 
 
+def _opt_id(v: Any) -> int | None | bool:
+    """dev/ino as stored by `_nz`: the full SIGNED 64-bit range. A large Windows file
+    ID folds negative, and refusing it dropped those rows on ingest (hosted windows
+    runner, 2026-10-07: 3 of 6 rows written)."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return False
+    try:
+        i = int(v)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return i if -_I64 <= i < _I64 else False
+
+
 def validate_row(r: Any, *, root: str, to_seq: int, g: _guards.Guards
                  ) -> tuple[dict | None, str | None]:
     """A pushed row, normalized -- or the reason it is refused. Pushed data is never
@@ -1142,7 +1157,7 @@ def validate_row(r: Any, *, root: str, to_seq: int, g: _guards.Guards
         return None, f"{path[:200]}: hash is not 64 hex chars"
     if ph and r.get("partial_algo") != PARTIAL_ALGO:
         return None, f"{path[:200]}: partial_algo {r.get('partial_algo')!r} != {PARTIAL_ALGO}"
-    dev, ino, nlink = _opt_int(r.get("dev")), _opt_int(r.get("ino")), _opt_int(r.get("nlink"))
+    dev, ino, nlink = _opt_id(r.get("dev")), _opt_id(r.get("ino")), _opt_int(r.get("nlink"))
     if dev is False or ino is False or nlink is False:
         return None, f"{path[:200]}: dev/ino/nlink out of range"
     seq = _opt_int(r.get("seq"))
