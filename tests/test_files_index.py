@@ -70,6 +70,27 @@ def test_open_index_pragmas_and_schema(tmp_path):
         d.close()
 
 
+def test_stat_ids_above_int64_store_and_stay_distinct(tmp_path):
+    """Windows NTFS file IDs and volume serials are UNSIGNED 64-bit; SQLite
+    INTEGER is signed. Unfolded, the hosted windows runner died "OverflowError:
+    Python int too large to convert to SQLite INTEGER" (2026-10-07). Folded
+    ids must fit, round-trip through SQLite, and stay distinct (hard-link
+    de-duplication keys on (dev, ino))."""
+    import sqlite3
+
+    raw = [1, (1 << 63) - 1, 1 << 63, (1 << 64) - 1, 12345]
+    folded = [F._nz(v) for v in raw]
+    assert all(-(1 << 63) <= v < (1 << 63) for v in folded), folded
+    assert len(set(folded)) == len(raw), "folding collapsed two distinct ids"
+    assert F._nz(12345) == 12345, "ordinary ids are unchanged"
+    assert F._nz(0) is None and F._nz(None) is None and F._nz("x") is None
+    con = sqlite3.connect(tmp_path / "ids.db")
+    con.execute("CREATE TABLE t (ino INTEGER)")
+    con.executemany("INSERT INTO t VALUES (?)", [(v,) for v in folded])
+    assert sorted(r[0] for r in con.execute("SELECT ino FROM t")) == sorted(folded)
+    con.close()
+
+
 def test_scan_indexes_flags_and_skips_git(db, root):
     st = _scan(db, root)
     assert st["files_seen"] == 6 and st["new"] == 6

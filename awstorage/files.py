@@ -399,12 +399,30 @@ def _no_hash(path: str) -> bool:
     return any(fnmatch.fnmatchcase(name, g) for g in NO_HASH_GLOBS)
 
 
+_U64, _I64 = 1 << 64, 1 << 63
+
+
 def _nz(v: Any) -> int | None:
+    """A stat field as an SQLite-storable int, or None when the OS gave none.
+
+    Windows reports st_ino (the NTFS file ID) and st_dev (the volume serial)
+    as UNSIGNED 64-bit -- and ReFS file IDs can be wider -- while SQLite
+    INTEGER is SIGNED 64-bit. Measured 2026-10-07 on a hosted windows runner:
+    the index died "OverflowError: Python int too large to convert to SQLite
+    INTEGER". Values are folded into the signed range by two's-complement
+    wrap, which is a bijection over 64 bits, so (dev, ino) identity -- what
+    hard-link de-duplication keys on -- survives exactly. "Absent" is judged
+    on the RAW value (0 means the OS did not provide it); a folded value may
+    be negative and is still a real id.
+    """
     try:
         i = int(v)
     except (TypeError, ValueError):
         return None
-    return i if i > 0 else None
+    if i <= 0:
+        return None
+    i %= _U64
+    return i - _U64 if i >= _I64 else i
 
 
 def _chunks(seq: list, n: int) -> Iterator[list]:
