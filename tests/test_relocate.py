@@ -380,6 +380,12 @@ def test_floors_from_topology_and_mini_parser():
 
 def test_repo_topology_declares_the_floors():
     repo = Path(__file__).resolve().parents[3]
+    # parents[3] is the monorepo's AitherOS/ only inside the monorepo. A
+    # published awstorage has no fleet topology to read, so skip ONLY when this
+    # is not a monorepo checkout -- inside it, a missing topology file stays a
+    # failure (the floors it declares are what this test protects).
+    if not (repo / "packages" / "awstorage").is_dir():
+        pytest.skip("standalone awstorage checkout: no fleet storage topology here")
     topo, floors, where = rl.load_relocate_topology(
         str(repo / "config" / "storage-topology.yaml"))
     assert floors["C:"] >= 40 and "default" in floors and where.endswith(".yaml")
