@@ -416,3 +416,84 @@ def test_cli_node_run_has_orders_only(capsys):
     with pytest.raises(SystemExit) as exc:
         main(["node-run", "--help"])
     assert exc.value.code == 0 and "--orders-only" in capsys.readouterr().out
+
+
+# ------------------------------------------------- archive card orders, wired by default
+
+
+def _archive_world(tmp_path: Path):
+    import hashlib
+    import os
+
+    from awstorage import manage
+    from awstorage.catalog import Catalog
+
+    from .attest_util import sign_card
+
+    root = tmp_path / "vol"
+    f = root / "logs" / "old.log"
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b"A" * 3000)
+    st = os.stat(f)
+    member = {"path": str(f), "bytes": st.st_size, "mtime_ns": st.st_mtime_ns,
+              "sha256": hashlib.sha256(f.read_bytes()).hexdigest(), "dev": st.st_dev,
+              "ino": st.st_ino, "nlink": 1}
+    prop = manage.propose_archive("test-node", member)
+    prop.id, prop.status, prop.card_id = 51, "approved", "d-51"
+    card = {"id": "d-51", "status": "answered", "answer": "approve",
+            "answered_via": "desk", "answered_by": "owner@test",
+            "facts": manage.card_spec(prop)["facts"]}
+    sign_card(card)
+    order_row = {"id": 51, "node": "test-node", "path": prop.path, "action": "archive",
+                 "bytes": prop.bytes, "cls": "archive", "status": "approved"}
+    return root, f, prop, card, order_row, Catalog(tmp_path / "node-manage.db")
+
+
+def test_default_context_without_a_strata_credential_refuses_archive(tmp_path: Path,
+                                                                     attested):
+    from awstorage.node_run import default_manage_context
+
+    root, f, prop, card, order_row, local = _archive_world(tmp_path)
+    local.close()
+    client = _ManageClient([order_row], {"order": prop.to_dict(), "card": card})
+    ctx = default_manage_context(client, "test-node", db=tmp_path / "ctx.db", env={})
+    try:
+        assert ctx.strata_hook is None and ctx.readback_hook is None
+        assert ctx.share_hook is None
+        [row] = apply_orders([order_row], roots=[root], manage=ctx)
+        assert row["outcome"] == "refused" and "read-back" in row["detail"]
+        assert f.exists()
+    finally:
+        ctx.catalog.close()
+
+
+def test_default_context_runs_an_archive_order_into_strata(tmp_path: Path, attested,
+                                                          monkeypatch):
+    from awstorage import strata
+    from awstorage.node_run import default_manage_context
+
+    from .strata_pool_stub import KEY, PoolStub
+
+    pool = PoolStub()
+
+    class _Http(strata.StrataTarget):  # the stub is plain http; the switch is explicit
+        def __init__(self, tier, **kw):
+            kw.pop("url", None)
+            super().__init__(tier, url=pool.url, insecure_http_for_tests=True, **kw)
+
+    monkeypatch.setattr(strata, "StrataTarget", _Http)
+    root, f, prop, card, order_row, local = _archive_world(tmp_path)
+    local.close()
+    client = _ManageClient([order_row], {"order": prop.to_dict(), "card": card})
+    ctx = default_manage_context(client, "test-node", db=tmp_path / "ctx.db",
+                                 env={strata.KEY_ENV: KEY,
+                                      "AWSTORAGE_SHARE_ROOT": str(tmp_path / "shares")})
+    try:
+        assert ctx.strata_hook and ctx.readback_hook and ctx.share_hook
+        [row] = apply_orders([order_row], roots=[root], manage=ctx)
+        assert row["outcome"] == "applied", row
+        assert pool.objects[prop.params["strata_path"]] == b"A" * 3000
+        assert not f.exists()  # quarantined only after the independent read-back
+    finally:
+        pool.close()
+        ctx.catalog.close()

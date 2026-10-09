@@ -37,7 +37,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from ._fs import ScanError, scan
 from .classify import classify_snapshot
@@ -210,19 +210,40 @@ def run_hash_orders(client: GatewayClient, node_id: str, orders: list[dict], *,
     return st
 
 
-def default_manage_context(client: GatewayClient, node_id: str,
-                           db: Optional[Path] = None) -> Optional[ManageContext]:
-    """Card orders fetched from Genesis over the gateway, recorded in the node-local
-    manage catalog. No transport hooks: archive/share refuse (ledgered) until a node
-    transport exists; dedup needs none."""
-    from .catalog import Catalog  # noqa: PLC0415
+#: Where `share` card orders publish (an awshare bundle per share). Unset = the
+#: share action is refused and ledgered, never published somewhere invented.
+SHARE_ROOT_ENV = "AWSTORAGE_SHARE_ROOT"
 
+
+def default_manage_context(client: GatewayClient, node_id: str,
+                           db: Optional[Path] = None,
+                           env: Optional[Mapping[str, str]] = None
+                           ) -> Optional[ManageContext]:
+    """Card orders fetched from Genesis over the gateway, recorded in the node-local
+    manage catalog, with the transport hooks this node is CONFIGURED for:
+
+    - archive: `strata.archive_hooks` -- a Strata write proven by stat, and an
+      independent read-back that hashes the stored bytes -- when the node holds a
+      Strata credential (AWSTORAGE_STRATA_BEARER or AWSTORAGE_STRATA_KEY);
+    - share: an awshare bundle under AWSTORAGE_SHARE_ROOT when that is set.
+
+    An unconfigured hook stays None, so that action is refused and ledgered --
+    never run against a transport that does not exist. dedup needs none."""
+    from .catalog import Catalog  # noqa: PLC0415
+    from .manage import local_awshare_hook  # noqa: PLC0415
+    from .strata import archive_hooks  # noqa: PLC0415
+
+    e = os.environ if env is None else env
     try:
         cat = Catalog(db or DEFAULT_MANAGE_DB)
     except Exception:  # noqa: BLE001 -- no local catalog: card orders are refused
         return None
+    strata_hook, readback_hook = archive_hooks(e)
+    share_root = (e.get(SHARE_ROOT_ENV) or "").strip()
+    share_hook = local_awshare_hook(share_root)[0] if share_root else None
     return ManageContext(fetch_order=lambda pid: fetch_manage_order(client, node_id, pid),
-                         catalog=cat)
+                         catalog=cat, strata_hook=strata_hook,
+                         readback_hook=readback_hook, share_hook=share_hook)
 
 
 def run_once(client: GatewayClient, *, node_id: str, roots: Iterable, depth: int = 3,
