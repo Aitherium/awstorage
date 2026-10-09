@@ -117,19 +117,37 @@ def test_awdit_present_records_every_decision_and_detects_tampering(world, tmp_p
 
 
 @pytest.mark.skipif(not _have("awdit"), reason="awdit not installed")
-def test_audit_append_is_linear_and_chains_with_a_concurrent_writer(tmp_path):
+def test_audit_append_is_linear_and_chains_with_a_concurrent_writer(tmp_path, monkeypatch):
     import awdit
+    import awdit.log as awdit_log
     log = tmp_path / "a.log"
-    t0 = time.monotonic()
-    for i in range(1500):
+    # awdit.append re-reads the whole log per call (head() walks it): quadratic, 2000
+    # appends took 19.6 s measured. Count the RECORDS read back instead of timing them
+    # -- an fsync per append on a loaded Windows host costs more than the re-read, so a
+    # wall-clock bound both flaked (6 runs in 8 over 12 s) and passed a quadratic path.
+    # Counting at read() (which head() calls through the module global) catches any
+    # walk of the log, not only one that goes through head().
+    records_read = []
+    real_read = awdit_log.read
+
+    def counting_read(path, *a, **k):
+        for rec in real_read(path, *a, **k):
+            records_read.append(str(path))
+            yield rec
+
+    monkeypatch.setattr(awdit_log, "read", counting_read)
+    monkeypatch.setattr(awdit, "read", counting_read)
+    for i in range(300):
         assert ig.audit_append(log, "quarantined", path=f"/t/item-{i}", bytes=i)["ok"]
-    elapsed = time.monotonic() - t0
-    # awdit.append re-reads the log per call (quadratic: 2000 took 19.6 s measured).
-    assert elapsed < 12, f"{elapsed:.1f}s for 1500 appends -- quadratic again?"
+    # Linear allows at most one full walk (<= 300 records); per-append re-reads are ~45k.
+    assert len(records_read) <= 300, (
+        f"{len(records_read)} records re-read for 300 appends -- quadratic again?")
+    monkeypatch.setattr(awdit_log, "read", real_read)
+    monkeypatch.setattr(awdit, "read", real_read)
     awdit.append(str(log), "someone-else", by="peer")  # another writer moves the head
     assert ig.audit_append(log, "deleted", path="/t/after")["ok"]
     r = awdit.verify(str(log))
-    assert r.ok and r.count == 1502, r.problems
+    assert r.ok and r.count == 302, r.problems
 
 
 def test_failed_audit_append_under_require_audit_keeps_the_item(world, tmp_path, monkeypatch):
