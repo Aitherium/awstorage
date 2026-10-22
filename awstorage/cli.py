@@ -1295,6 +1295,8 @@ def main(argv: list[str] | None = None) -> int:
     _add_relocate_parser(sub)
     from .cli_suggest import add_parsers
     add_parsers(sub)
+    from .offload import add_parsers as add_offload_parsers
+    add_offload_parsers(sub)
 
     a = ap.parse_args(argv)
     if a.self_test:

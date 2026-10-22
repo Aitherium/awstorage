@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.0 -- 2026-10-22
+
+`awstorage offload` / `awstorage restore`: move a cold tree off the machine into S3.
+Per file: upload (single put, or a journaled multipart upload that resumes by listing
+the parts already stored), verify against the SHA-256 S3 computed over the stored
+bytes (full-object or composite; `--verify full` re-downloads instead), append a
+record to the in-place stub (`AWOFFLOADED.jsonl` / `<file>.awoffload.jsonl`), and
+only then delete. `restore` downloads, checks every sha256 against the stub, and
+moves files into place (`--file` for one, `--to` for elsewhere). `--dry-run` ranks a
+root's children by size and last access and prices them. Credential paths, VM disks,
+database files, tenant/customer paths and the topology's do-not-move roots are
+refused before a byte moves. boto3 is an optional extra (`awstorage[s3]`), imported
+only by these verbs.
+
 ## 0.5.3 -- 2026-10-07
 
 Windows file IDs survive the delta push. 0.5.2 folded unsigned 64-bit NTFS/ReFS

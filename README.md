@@ -349,6 +349,24 @@ end under its floor (unlisted drives: `--default-floor-gb`, 20). Run it before m
 data -- on 2026-09-28 a peer moved 89 GB onto a nearly-full C:. Python:
 `awstorage.place("90GB", {"C:": 40, "E:": 30}, source="D:/models")`.
 
+## When every drive is short: offload to S3 (0.6.0)
+
+```bash
+pip install "awstorage[s3]"
+awstorage offload D:/cache D:/archive --dry-run        # rank children by size + last access
+awstorage offload D:/archive/old-builds --to cold      # upload, verify, THEN delete
+awstorage restore D:/archive/old-builds --file a.bin --to /tmp/probe   # one file back
+awstorage restore D:/archive/old-builds                # everything back, sha256-checked
+```
+
+The target (`--to cold`) is an `object_stores.<name>` entry (bucket, region,
+credential pairs) in your storage-topology file, or `--bucket/--region`. Each file is
+deleted only after S3's own SHA-256 of the STORED bytes matches the one computed
+locally, and only after a line for it is fsynced into the stub left in its place
+(`AWOFFLOADED.jsonl`), which is also copied to the bucket. A large file uploads in
+parts whose upload id is journaled, so a re-run sends only the missing parts.
+Credential paths, VM disks, database files and tenant/customer paths are refused.
+
 ## Shelf safety
 
 The harvest shelf is a drive too (E: sat at 99 %). With floors set (`--floors` on
