@@ -117,7 +117,10 @@ def test_auto_hash_only_candidates_min_bytes_and_confirms(db, root):
     assert a["ino"] and a["dev"], "the hash stage records the inode"
 
 
-def test_rescan_writes_and_rehashes_only_what_changed(db, root):
+def test_rescan_writes_and_rehashes_only_what_changed(db, root, monkeypatch):
+    # The WALK's rescan accounting (every file re-examined, only changes written). On
+    # Windows NTFS a repeat scan would take the USN path instead: test_files_usn.py.
+    monkeypatch.setattr(F._usn, "supported", lambda: False)
     _scan(db, root, hash_mode="full")
     seq1 = F.current_seq(db)
     st2 = _scan(db, root, hash_mode="full")

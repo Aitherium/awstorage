@@ -54,6 +54,9 @@ Stdlib only. Works alone, offline, on the box whose disk is full.
    copies a manage action could really reclaim. Rescans are incremental: only files
    whose size, mtime or hash changed are written (each takes a new `seq`); files a
    COMPLETED walk no longer sees become tombstones; a truncated walk deletes nothing.
+   On Windows NTFS a repeat scan reads the USN change journal since the last walk and
+   re-reads only the directories it names -- no admin needed; any doubt is a full walk,
+   and the scan JSON says which (`mode`, `usn_fallback_reason`).
    Credential-shaped files (`.ssh`, `.env*`, `*.pem`, ...) are indexed but flagged and
    redacted for any non-platform reader (`awstorage.guards`).
 

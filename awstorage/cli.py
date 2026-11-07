@@ -15,6 +15,7 @@
     awstorage hash <path...>
     awstorage whoami
     awstorage files scan <root>... | --all-volumes [--hash auto|none|full] [--node ID]
+        (Windows NTFS: a repeat scan reads the USN change journal, not every file)
     awstorage files find <q> [--ext pdf] [--min-bytes N] [--newer DAYS] [--node ID]
                              [--local|--remote] [--json]
     awstorage files dupes [--min-bytes N] [--node ID] [--local|--remote] [--json]
@@ -432,6 +433,14 @@ def _cmd_files_scan(a) -> int:
           f"{st['new']} new, {st['changed']} changed, {st['unchanged']} unchanged, "
           f"{st['removed']} removed, {st['errors']} errors, {st['elapsed_s']}s"
           + ("  [TRUNCATED -- nothing pruned]" if st["truncated"] else ""))
+    for r in st["roots"]:
+        if r.get("mode") == "usn":
+            print(f"  {r['root']}: USN journal -- {r['usn_records']} records,"
+                  f" {r['usn_dirs_relisted']} dirs re-read, {r['usn_subtrees_walked']}"
+                  f" subtrees walked" + ("  [unresolved records: next scan walks in full]"
+                                         if r.get("usn_walk_next") else ""))
+        elif r.get("usn_fallback_reason") not in (None, "not_windows"):
+            print(f"  {r['root']}: full walk (USN journal not used: {r['usn_fallback_reason']})")
     print(f"  hashed: {st['partial_hashed']} partial, {st['full_hashed']} full, "
           f"{human(st['bytes_read'])} read"
           + (f"  [hash budget spent; {human(st['bytes_remaining'])} still unhashed]"

@@ -18,7 +18,10 @@ family, not a third inventory (it replaces the design's unimplemented ``artifact
 **Incremental.** A rescan writes ONLY rows whose size, mtime or hash actually changed;
 each such write takes a new node-local ``seq``. Deletions are found after a COMPLETED
 walk through a TEMP ``seen(path)`` table and become tombstones; a truncated walk
-deletes nothing. A delta push sends ``seq > since_seq``.
+deletes nothing. A delta push sends ``seq > since_seq``. On Windows NTFS a repeat scan
+of a root reads the USN change journal from the cursor the last full walk left in
+``meta`` and re-reads only the directories it names (`awstorage.usn`); every reason
+it cannot be trusted is a full walk, reported as ``mode`` / ``usn_fallback_reason``.
 
 **Duplicates, cheaply.** Ported from the dedup engine (credited in the commit; source
 was an uncommitted ``lib/storage/dedup.py``): size bucket -> head+tail partial hash ->
@@ -32,7 +35,7 @@ could really reclaim.
 on it and duplicate groups never cross it. The Genesis router stamps it from the
 authenticated caller -- this module never reads it from a payload.
 
-Stdlib only. Never deletes a file on disk, only index rows.
+Stdlib only (ctypes on Windows). Never deletes a file on disk, only index rows.
 """
 
 from __future__ import annotations
@@ -41,12 +44,14 @@ import base64
 import fnmatch
 import hashlib
 import json
+import logging
 import math
 import mimetypes
 import os
 import re
 import sqlite3
 import stat as stat_mod
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -54,6 +59,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 from . import guards as _guards
+from . import usn as _usn
+
+logger = logging.getLogger(__name__)
 
 # -- wire constants (a node and Genesis must agree on these) ------------------------
 PARTIAL_BYTES = 64 * 1024
@@ -604,11 +612,13 @@ WalkItem = tuple  # (path, bytes, mtime_ns, dev, ino, nlink, git_root)
 
 
 def _walk(root: str, exclude: set[str], deadline: float,
-          skip_dir: Callable[[str], bool] | None = None) -> Iterator[WalkItem | None]:
+          skip_dir: Callable[[str], bool] | None = None,
+          git_root: str | None = None) -> Iterator[WalkItem | None]:
     """Yield (path, bytes, mtime_ns, dev, ino, nlink, git_root) per regular file; None
     once per unreadable entry. Symlinks and reparse points (junctions) are never
-    followed nor indexed. Raises TimeoutError at the deadline."""
-    stack: list[tuple[str, str | None]] = [(root, None)]
+    followed nor indexed. Raises TimeoutError at the deadline. `git_root` seeds the
+    repository a SUBTREE walk starts inside (the USN path re-walks subtrees)."""
+    stack: list[tuple[str, str | None]] = [(root, git_root)]
     while stack:
         if time.monotonic() >= deadline:
             raise TimeoutError
@@ -656,22 +666,32 @@ def _row_from_walk(item: WalkItem, scanned_at: str, g: _guards.Guards) -> dict:
             "never": 1 if g.is_never(path) else 0, "seq": None, "scanned_at": scanned_at}
 
 
-def index_root(db: sqlite3.Connection, root: str | os.PathLike, *, node: str,
-               tenant: str = PLATFORM_TENANT, time_budget_s: float = 3600.0,
-               exclude_dirs: Iterable[str] | None = None, guards: _guards.Guards | None = None,
-               skip_never_dirs: bool = False, stats: dict | None = None,
-               progress: Callable[[dict], None] | None = None) -> dict:
-    """Walk one root into the index. Only changed rows are written; after a COMPLETED
-    walk, rows under the root that were not seen become tombstones."""
-    rootn = norm_root(root)
-    if not os.path.isdir(rootn):
-        raise NotADirectoryError(f"root is not a directory: {root}")
-    g = guards or _guards.Guards()
-    exclude = {n.lower() for n in (DEFAULT_EXCLUDE_DIRS if exclude_dirs is None
-                                   else exclude_dirs)}
-    st = stats if stats is not None else _new_stats(node, tenant)
-    scanned_at = iso_now()
-    deadline = time.monotonic() + float(time_budget_s)
+def _prune_unseen(db: sqlite3.Connection, tenant: str, node: str, base: str) -> int:
+    """Tombstone every row under `base` that is not in temp.seen (keyset pages)."""
+    lo, hi = _under(_prefix(base))
+    after = ""
+    removed = 0
+    while True:
+        gone = [r[0] for r in db.execute(
+            "SELECT f.path FROM files f WHERE f.tenant = ? AND f.node = ? AND f.path >= ?"
+            " AND f.path < ? AND f.path > ? AND NOT EXISTS"
+            " (SELECT 1 FROM temp.seen s WHERE s.path = f.path) ORDER BY f.path LIMIT ?",
+            (tenant, node, lo, hi, after, TXN_ROWS))]
+        if not gone:
+            break
+        removed += apply_changes(db, tenant, node, deletes=gone)["deleted"]
+        after = gone[-1]
+    return removed
+
+
+def _walk_into(db: sqlite3.Connection, base: str, *, tenant: str, node: str,
+               exclude: set[str], deadline: float, g: _guards.Guards,
+               skip_dir: Callable[[str], bool] | None, scanned_at: str, st: dict,
+               git_root: str | None = None,
+               progress: Callable[[dict], None] | None = None
+               ) -> tuple[int, int, int, bool, int]:
+    """Walk `base` into the index; after a COMPLETED walk, rows under it that were not
+    seen become tombstones. Returns (files, bytes, errors, truncated, removed)."""
     db.execute("CREATE TEMP TABLE IF NOT EXISTS seen(path TEXT PRIMARY KEY)")
     db.execute("DELETE FROM temp.seen")
     batch: list[dict] = []
@@ -688,8 +708,7 @@ def index_root(db: sqlite3.Connection, root: str | os.PathLike, *, node: str,
             st[k] += res[k]
 
     try:
-        for item in _walk(rootn, exclude, deadline,
-                          skip_dir=g.is_never_dir if skip_never_dirs else None):
+        for item in _walk(base, exclude, deadline, skip_dir=skip_dir, git_root=git_root):
             if item is None:
                 errors += 1
                 continue
@@ -701,40 +720,422 @@ def index_root(db: sqlite3.Connection, root: str | os.PathLike, *, node: str,
                 batch = []
             if progress is not None and time.monotonic() - last_tick >= 5.0:
                 last_tick = time.monotonic()
-                progress({"phase": "walk", "root": rootn, "files": files, "bytes": total})
+                progress({"phase": "walk", "root": base, "files": files, "bytes": total})
     except TimeoutError:
         truncated = True
     if batch:
         flush()
-    removed = 0
-    if not truncated:
-        lo, hi = _under(_prefix(rootn))
-        after = ""
-        while True:
-            gone = [r[0] for r in db.execute(
-                "SELECT f.path FROM files f WHERE f.tenant = ? AND f.node = ? AND f.path >= ?"
-                " AND f.path < ? AND f.path > ? AND NOT EXISTS"
-                " (SELECT 1 FROM temp.seen s WHERE s.path = f.path) ORDER BY f.path LIMIT ?",
-                (tenant, node, lo, hi, after, TXN_ROWS))]
-            if not gone:
-                break
-            removed += apply_changes(db, tenant, node, deletes=gone)["deleted"]
-            after = gone[-1]
+    removed = 0 if truncated else _prune_unseen(db, tenant, node, base)
     with db:
-        db.execute(
-            "INSERT INTO roots(tenant, node, root, files, bytes, scanned_at, truncated, errors)"
-            " VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(tenant, node, root) DO UPDATE SET"
-            " files=excluded.files, bytes=excluded.bytes, scanned_at=excluded.scanned_at,"
-            " truncated=excluded.truncated, errors=excluded.errors",
-            (tenant, node, rootn, files, total, scanned_at, 1 if truncated else 0, errors))
         db.execute("DELETE FROM temp.seen")
+    return files, total, errors, truncated, removed
+
+
+def _upsert_root(db: sqlite3.Connection, tenant: str, node: str, rootn: str, files: int,
+                 total: int, scanned_at: str, truncated: bool, errors: int) -> None:
+    db.execute(
+        "INSERT INTO roots(tenant, node, root, files, bytes, scanned_at, truncated, errors)"
+        " VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(tenant, node, root) DO UPDATE SET"
+        " files=excluded.files, bytes=excluded.bytes, scanned_at=excluded.scanned_at,"
+        " truncated=excluded.truncated, errors=excluded.errors",
+        (tenant, node, rootn, files, total, scanned_at, 1 if truncated else 0, errors))
+
+
+def index_root(db: sqlite3.Connection, root: str | os.PathLike, *, node: str,
+               tenant: str = PLATFORM_TENANT, time_budget_s: float = 3600.0,
+               exclude_dirs: Iterable[str] | None = None, guards: _guards.Guards | None = None,
+               skip_never_dirs: bool = False, stats: dict | None = None,
+               progress: Callable[[dict], None] | None = None) -> dict:
+    """Index one root. Only changed rows are written; after a COMPLETED walk, rows under
+    the root that were not seen become tombstones.
+
+    On Windows NTFS a root that was fully walked before is brought up to date from the
+    USN change journal instead (`mode: "usn"`): only directories the journal names are
+    re-read. Every reason that path cannot be trusted -- not Windows, not NTFS, no
+    cursor, journal id changed, cursor older than the journal, access denied, any
+    error -- is a full walk (`mode: "walk"`) with the reason in `usn_fallback_reason`."""
+    rootn = norm_root(root)
+    if not os.path.isdir(rootn):
+        raise NotADirectoryError(f"root is not a directory: {root}")
+    g = guards or _guards.Guards()
+    exclude = {n.lower() for n in (DEFAULT_EXCLUDE_DIRS if exclude_dirs is None
+                                   else exclude_dirs)}
+    st = stats if stats is not None else _new_stats(node, tenant)
+    scanned_at = iso_now()
+    deadline = time.monotonic() + float(time_budget_s)
+    skip_dir = g.is_never_dir if skip_never_dirs else None
+    windows = _usn.supported()
+    reason = "not_windows"
+    start: dict | None = None
+    if windows:
+        cfg = _usn_config(exclude, skip_never_dirs, g)
+        try:
+            _usn_index(db, rootn, tenant=tenant, node=node, exclude=exclude, g=g,
+                       skip_dir=skip_dir, cfg=cfg, deadline=deadline,
+                       scanned_at=scanned_at, st=st)
+            _usn_summary(st)
+            return st
+        except _UsnFallbackError as e:
+            reason, start = e.reason, e.start
+        except _usn.UsnError as e:
+            reason = e.reason
+        except Exception as e:  # noqa: BLE001 -- ANY failure of the fast path is a walk
+            reason = f"error: {type(e).__name__}: {e}"[:300]
+        logger.warning("files scan %s: USN journal not used (%s) -- full walk", rootn, reason)
+    files, total, errors, truncated, removed = _walk_into(
+        db, rootn, tenant=tenant, node=node, exclude=exclude, deadline=deadline, g=g,
+        skip_dir=skip_dir, scanned_at=scanned_at, st=st, progress=progress)
+    with db:
+        _upsert_root(db, tenant, node, rootn, files, total, scanned_at, truncated, errors)
+        if windows:
+            # The cursor was read BEFORE the walk, so whatever changed during it is
+            # replayed next time; a truncated walk leaves no cursor (the index is partial).
+            _usn_save(db, tenant, node, rootn, None if truncated else start)
     st["roots"].append({"root": rootn, "files": files, "bytes": total, "errors": errors,
-                        "truncated": truncated, "scanned_at": scanned_at})
+                        "truncated": truncated, "scanned_at": scanned_at, "mode": "walk",
+                        "usn_fallback_reason": reason})
     st["files_seen"] += files
     st["removed"] += removed
     st["errors"] += errors
     st["truncated"] = st["truncated"] or truncated
+    _usn_summary(st)
     return st
+
+
+# ---------------------------------------------------------------------------
+# NTFS USN journal: a repeat scan reads only what changed
+# ---------------------------------------------------------------------------
+#
+# Unprivileged reads (measured 2026-11-07, Windows 11 26300, NOT elevated) return
+# records WITHOUT file names, so nothing here needs a name. A record says "directory P
+# changed" (its parent FRN) or, for a directory record, "directory D was created /
+# moved in / re-pointed / re-secured" (its own FRN). P and D are resolved to their
+# CURRENT path with OpenFileById, then:
+#   * every changed P is re-listed shallowly and diffed against the rows whose parent
+#     is P and the dirs-rollup rows whose parent is P (a vanished subdirectory prunes
+#     its subtree; a subdirectory the index has never seen is walked);
+#   * every created / moved-in / re-pointed D is walked as a subtree.
+# The end state is what a full walk gives: a stale row has a shallowest path component
+# that left its place during the window, and that component's unchanged parent carries
+# the record. A FRN that no longer exists must be PROVEN deleted by a FILE_DELETE
+# record; a parent directory we may not open (winerror 5) is one the walk cannot list
+# either (measured on C:: all 70,039 listable dirs opened by id; the 108 that did not
+# were all unlistable) and is counted in `usn_denied`. Anything else unresolvable
+# marks the root for a full walk on the next scan (`usn_walk_next`).
+
+_USN_CURSOR_V = 1
+_NOT_FOUND = frozenset({2, 3, 87, 1168})
+_SECURITY_CHANGE = 0x00000800
+_DIR_REWALK = (_usn.REASON_FILE_CREATE | _usn.REASON_RENAME_NEW_NAME
+               | _usn.REASON_REPARSE_POINT_CHANGE | _SECURITY_CHANGE)
+_CREATED = _usn.REASON_FILE_CREATE | _usn.REASON_RENAME_NEW_NAME
+_usn_volume: Callable[[str], Any] = _usn.Volume   # tests inject a fake volume here
+
+
+class _UsnFallbackError(Exception):
+    def __init__(self, reason: str, start: dict | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.start = start
+
+
+def _usn_config(exclude: set[str], skip_never_dirs: bool, g: _guards.Guards) -> str:
+    """What the rows under a cursor depend on besides the disk: any change -> a walk."""
+    return json.dumps({"exclude": sorted(exclude), "skip_never_dirs": bool(skip_never_dirs),
+                       "never_roots": list(g.never_roots)}, sort_keys=True)
+
+
+def _usn_key(tenant: str, node: str, root: str) -> str:
+    return f"usn|{tenant}|{node}|{root}"
+
+
+def _usn_load(db: sqlite3.Connection, tenant: str, node: str, root: str) -> dict | None:
+    row = db.execute("SELECT v FROM meta WHERE k = ?", (_usn_key(tenant, node, root),)
+                     ).fetchone()
+    if not row:
+        return None
+    try:
+        cur = json.loads(row[0])
+    except ValueError:
+        return None
+    return cur if isinstance(cur, dict) else None
+
+
+def _usn_save(db: sqlite3.Connection, tenant: str, node: str, root: str,
+              cursor: dict | None) -> None:
+    key = _usn_key(tenant, node, root)
+    if cursor is None:
+        db.execute("DELETE FROM meta WHERE k = ?", (key,))
+    else:
+        db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)",
+                   (key, json.dumps(cursor, sort_keys=True)))
+
+
+def _usn_summary(st: dict) -> None:
+    roots = st["roots"]
+    st["mode"] = "usn" if roots and all(r.get("mode") == "usn" for r in roots) else "walk"
+    st["usn_fallback_reason"] = next(
+        (r["usn_fallback_reason"] for r in roots if r.get("usn_fallback_reason")), None)
+
+
+def _to_index(path: str, rootn: str) -> str | None:
+    """A resolved path in the index's spelling of `rootn`, or None when outside it."""
+    p = _clean(norm_path(path))
+    ci = sys.platform == "win32"
+    a, b = (p.lower(), rootn.lower()) if ci else (p, rootn)
+    if a == b:
+        return rootn
+    pre = _prefix(b)
+    return _prefix(rootn) + p[len(pre):] if a.startswith(pre) else None
+
+
+def _root_canonical(rootn: str) -> bool:
+    real = _clean(norm_path(os.path.realpath(rootn)))
+    return (real.lower() == rootn.lower()) if sys.platform == "win32" else real == rootn
+
+
+def _usn_plan(vol: Any, records: list, rootn: str, end_usn: int, journal_id: int
+              ) -> tuple[dict[str, int], set[str], int, int]:
+    """records -> ({dir to re-list: reasons seen in it}, subtrees to walk, denied,
+    unresolved)."""
+    deleted = {r.frn for r in records if r.reason & _usn.REASON_FILE_DELETE}
+    parents: dict[int, int] = {}
+    for r in records:
+        parents[r.parent_frn] = parents.get(r.parent_frn, 0) | r.reason
+    moved = {r.frn for r in records if r.is_dir and r.reason & _DIR_REWALK}
+    relist: dict[str, int] = {}
+    walk: set[str] = set()
+    missing: list[int] = []
+    denied = unresolved = 0
+    for frn in set(parents) | moved:
+        path, err = vol.resolve(frn)
+        if path is None:
+            if err in _NOT_FOUND:
+                missing.append(frn)
+            elif err == _usn.ERROR_ACCESS_DENIED and frn not in moved:
+                denied += 1
+            else:
+                unresolved += 1
+            continue
+        p = _to_index(path, rootn)
+        if p is None:
+            continue
+        if frn in parents:
+            relist[p] = relist.get(p, 0) | parents[frn]
+        if frn in moved:
+            walk.add(p)
+    unproven = [f for f in missing if f not in deleted]
+    if unproven:
+        # Gone but not deleted inside the window: deleted after it? Read on to now.
+        later = {r.frn for r in vol.read_until(end_usn, vol.query().next_usn, journal_id)
+                 if r.reason & _usn.REASON_FILE_DELETE}
+        unresolved += sum(1 for f in unproven if f not in later)
+    return relist, walk, denied, unresolved
+
+
+def _usn_index(db: sqlite3.Connection, rootn: str, *, tenant: str, node: str,
+               exclude: set[str], g: _guards.Guards,
+               skip_dir: Callable[[str], bool] | None, cfg: str, deadline: float,
+               scanned_at: str, st: dict) -> None:
+    if not _root_canonical(rootn):
+        raise _UsnFallbackError("root_not_canonical")
+    vol = _usn_volume(rootn)
+    try:
+        j = vol.query()
+        start = {"v": _USN_CURSOR_V, "volume": vol.volume_name, "journal_id": j.journal_id,
+                 "next_usn": j.next_usn, "config": cfg}
+        cur = _usn_load(db, tenant, node, rootn)
+        why = None
+        if cur is None:
+            why = "no_cursor"
+        elif cur.get("walk_next"):
+            why = "marked_for_walk"
+        elif cur.get("v") != _USN_CURSOR_V or cur.get("config") != cfg:
+            why = "config_changed"
+        elif cur.get("volume") != vol.volume_name:
+            why = "volume_changed"
+        elif cur.get("journal_id") != j.journal_id:
+            why = "journal_id_changed"
+        elif int(cur.get("next_usn", -1)) < max(j.first_usn, j.lowest_valid_usn):
+            why = "journal_wrapped"
+        elif int(cur["next_usn"]) > j.next_usn:
+            why = "cursor_ahead"
+        if why:
+            raise _UsnFallbackError(why, start)
+        assert cur is not None
+        try:
+            records = list(vol.read_until(int(cur["next_usn"]), j.next_usn, j.journal_id))
+            relist, walk, denied, unresolved = _usn_plan(vol, records, rootn, j.next_usn,
+                                                         j.journal_id)
+        except _usn.UsnError as e:
+            raise _UsnFallbackError(e.reason, start) from e
+        res = _usn_apply(db, rootn, relist, walk, tenant=tenant, node=node, exclude=exclude,
+                         g=g, skip_dir=skip_dir, deadline=deadline, scanned_at=scanned_at,
+                         st=st)
+    finally:
+        vol.close()
+    truncated = res["truncated"]
+    row = db.execute("SELECT files, bytes FROM dirs WHERE tenant = ? AND node = ? AND path = ?",
+                     (tenant, node, rootn)).fetchone()
+    files, total = (int(row[0]), int(row[1])) if row else (0, 0)
+    with db:
+        _upsert_root(db, tenant, node, rootn, files, total, scanned_at, truncated,
+                     res["errors"])
+        if not truncated:   # a truncated pass keeps the old cursor and replays next time
+            _usn_save(db, tenant, node, rootn, dict(start, walk_next=bool(unresolved)))
+    if unresolved:
+        logger.warning("files scan %s: %d USN records could not be resolved -- the next"
+                       " scan walks the root in full", rootn, unresolved)
+    st["roots"].append({"root": rootn, "files": files, "bytes": total,
+                        "errors": res["errors"], "truncated": truncated,
+                        "scanned_at": scanned_at, "mode": "usn", "usn_fallback_reason": None,
+                        "usn_records": len(records), "usn_dirs_relisted": res["relisted"],
+                        "usn_subtrees_walked": res["walked"], "usn_denied": denied,
+                        "usn_unresolved": unresolved, "usn_walk_next": bool(unresolved)})
+    st["files_seen"] += res["files"]
+    st["removed"] += res["removed"]
+    st["errors"] += res["errors"]
+    st["truncated"] = st["truncated"] or truncated
+
+
+def _usn_apply(db: sqlite3.Connection, rootn: str, relist: dict[str, int], walk: set[str],
+               *, tenant: str, node: str, exclude: set[str], g: _guards.Guards,
+               skip_dir: Callable[[str], bool] | None, deadline: float, scanned_at: str,
+               st: dict) -> dict:
+    """Re-list `relist` shallowly and walk `walk` as subtrees (see the section note)."""
+    out = {"files": 0, "removed": 0, "errors": 0, "truncated": False, "relisted": 0,
+           "walked": 0}
+    gits: dict[str, str | None] = {}
+    rpre = _prefix(rootn)
+    walk_set = set(walk)
+
+    def inside(p: str, top: str) -> bool:
+        return p == top or p.startswith(_prefix(top))
+
+    def git_for(d: str | None) -> str | None:
+        """The label the walk gives files in `d`: the deepest directory from the root
+        down to `d` holding a `.git` entry (nothing above the root counts)."""
+        if d is None or not inside(d, rootn):
+            return None
+        if d not in gits:
+            here = os.path.lexists(_prefix(d) + ".git")
+            gits[d] = d if here else (None if d == rootn else git_for(parent_of(d)))
+        return gits[d]
+
+    def allowed(d: str) -> bool:
+        """Would the walk from the root descend into directory `d`?"""
+        if d != rootn:
+            parts = d[len(rpre):].split("/")
+            for i, part in enumerate(parts):
+                if part.lower() in exclude:
+                    return False
+                if skip_dir is not None and skip_dir(rpre + "/".join(parts[:i + 1])):
+                    return False
+        try:
+            s = os.lstat(d)
+        except OSError:
+            return False
+        if d != rootn and (stat_mod.S_ISLNK(s.st_mode)
+                           or getattr(s, "st_file_attributes", 0) & _REPARSE):
+            return False
+        return stat_mod.S_ISDIR(s.st_mode)
+
+    def prune(base: str) -> None:
+        db.execute("CREATE TEMP TABLE IF NOT EXISTS seen(path TEXT PRIMARY KEY)")
+        with db:
+            db.execute("DELETE FROM temp.seen")
+        out["removed"] += _prune_unseen(db, tenant, node, base)
+
+    def has_row(base: str, git_root: str | None) -> bool:
+        lo, hi = _under(_prefix(base))
+        return db.execute("SELECT 1 FROM files WHERE tenant = ? AND node = ? AND path >= ?"
+                          " AND path < ? AND git_root IS ? LIMIT 1",
+                          (tenant, node, lo, hi, git_root)).fetchone() is not None
+
+    def relist_one(p: str, reasons: int) -> None:
+        if time.monotonic() >= deadline:
+            raise TimeoutError
+        out["relisted"] += 1
+        ok = allowed(p)
+        entries: list = []
+        if ok:
+            try:
+                with os.scandir(p) as it:
+                    entries = list(it)
+            except OSError:
+                out["errors"] += 1     # the walk counts it and indexes nothing beneath
+        has_git = any(e.name == ".git" for e in entries)
+        above = None if p == rootn else git_for(parent_of(p))
+        git = p if has_git else above
+        gits[p] = git
+        indexed = dict(db.execute("SELECT path, git_root FROM files WHERE tenant = ? AND"
+                                  " node = ? AND parent = ?", (tenant, node, p)).fetchall())
+        # A .git that appeared or vanished here re-labels every row beneath p.
+        stale = any(gr != git for gr in indexed.values()) or (
+            has_row(p, above) if has_git and reasons & _CREATED
+            else has_row(p, p) if not has_git and reasons & _usn.LEAVING else False)
+        if stale:
+            walk_set.add(p)
+            return
+        items: list[WalkItem] = []
+        subdirs: set[str] = set()
+        for e in entries:
+            try:
+                if e.name.lower() in exclude:
+                    continue
+                s = e.stat(follow_symlinks=False)
+                if e.is_symlink() or getattr(s, "st_file_attributes", 0) & _REPARSE:
+                    continue
+                path = norm_path(e.path)
+                if stat_mod.S_ISDIR(s.st_mode):
+                    if skip_dir is None or not skip_dir(path):
+                        subdirs.add(path)
+                elif stat_mod.S_ISREG(s.st_mode):
+                    items.append((path, int(s.st_size), int(s.st_mtime_ns), _nz(s.st_dev),
+                                  _nz(s.st_ino), _nz(s.st_nlink), git))
+            except OSError:
+                out["errors"] += 1
+        seen = {i[0] for i in items}
+        res = apply_changes(db, tenant, node,
+                            upserts=[_row_from_walk(i, scanned_at, g) for i in items],
+                            deletes=[x for x in indexed if x not in seen])
+        for k in ("new", "changed", "unchanged"):
+            st[k] += res[k]
+        out["removed"] += res["deleted"]
+        out["files"] += len(items)
+        known = {r[0] for r in db.execute("SELECT path FROM dirs WHERE tenant = ? AND"
+                                          " node = ? AND parent = ?", (tenant, node, p))}
+        for d in known - subdirs:
+            prune(d)
+        walk_set.update(subdirs - known)
+
+    try:
+        for p in sorted(relist):
+            if not any(inside(p, w) for w in walk_set):
+                relist_one(p, relist[p])
+        tops: list[str] = []
+        for w in sorted(walk_set):
+            if not any(inside(w, t) for t in tops):
+                tops.append(w)
+        for w in tops:
+            if time.monotonic() >= deadline:
+                raise TimeoutError
+            if not allowed(w):
+                prune(w)
+                continue
+            out["walked"] += 1
+            seed = None if w == rootn else git_for(parent_of(w))
+            files, _b, errors, truncated, removed = _walk_into(
+                db, w, tenant=tenant, node=node, exclude=exclude, deadline=deadline, g=g,
+                skip_dir=skip_dir, scanned_at=scanned_at, st=st, git_root=seed)
+            out["files"] += files
+            out["errors"] += errors
+            out["removed"] += removed
+            if truncated:
+                raise TimeoutError
+    except TimeoutError:
+        out["truncated"] = True
+    return out
 
 
 # ---------------------------------------------------------------------------

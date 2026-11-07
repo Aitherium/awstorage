@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.0 -- 2026-11-07
+
+`files scan` is incremental on Windows NTFS. After a completed walk the root keeps a
+USN change-journal cursor (journal id + next USN, read BEFORE the walk) in `meta`; the
+next scan reads only the records since it and re-reads only the directories they name
+(a changed directory is re-listed shallowly, a created / moved-in / re-pointed one is
+walked as a subtree, a vanished one is pruned), so `seq` -- and the delta push -- carry
+exactly what changed. Un-elevated: the journal is queried and read
+(`FSCTL_READ_UNPRIVILEGED_USN_JOURNAL`) through a handle on the volume's root
+directory; those records carry no names, which the design never needs. A full walk
+still runs -- and the scan JSON says why in `mode` / `usn_fallback_reason` -- when the
+host is not Windows, the volume is not NTFS, there is no cursor, the journal id
+changed, the cursor fell off the journal, access is denied, the scan options changed,
+or anything errors; a record that cannot be resolved marks the root for a full walk on
+the next scan. Non-Windows scans index exactly as before (the JSON gains `mode: walk`).
+
 ## 0.6.0 -- 2026-10-22
 
 - `offload` / `restore`: move a cold tree off the machine into S3 -- per-file SHA-256
