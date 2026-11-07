@@ -2,6 +2,10 @@
 
 ## 0.6.0 -- 2026-10-22
 
+- `offload` / `restore`: move a cold tree off the machine into S3 -- per-file SHA-256
+  verification against the stored bytes, resumable multipart uploads, in-place stubs,
+  refuse-before-move path rules, and boto3 as an optional extra (`awstorage[s3]`).
+
 `awstorage offload` / `awstorage restore`: move a cold tree off the machine into S3.
 Per file: upload (single put, or a journaled multipart upload that resumes by listing
 the parts already stored), verify against the SHA-256 S3 computed over the stored
