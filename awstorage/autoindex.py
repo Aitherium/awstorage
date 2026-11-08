@@ -88,11 +88,16 @@ def pick_index_dir(volumes: list[dict] | None = None, *,
 
 
 def load_config(path: Path | None = None) -> dict:
+    """The enrolment config. A config written before 0.9.0 has no ``inventory_publish``;
+    it exists only on an enrolled node, so the signed inventory defaults ON there."""
     try:
         d = json.loads((path or config_path()).read_text(encoding="utf-8"))
-        return d if isinstance(d, dict) else {}
     except (OSError, ValueError):
         return {}
+    if not isinstance(d, dict):
+        return {}
+    d.setdefault("inventory_publish", True)
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -129,13 +134,21 @@ def run_pass(cfg: dict | None = None, *, run: Callable[..., Any] | None = None,
     env = {**os.environ, "TMP": str(tmp), "TEMP": str(tmp), "TMPDIR": str(tmp),
            "SQLITE_TMPDIR": str(tmp), "AWSTORAGE_NODE": node}
     catalog = str(index_dir / "catalog.db")
+    publish = bool(cfg.get("inventory_publish"))
+    receipt["publish_exit"] = None if publish else "disabled"
     steps = (
         ("scan", [py, "-m", "awstorage", "files", "scan", "--all-volumes", "--hash", "auto",
                   "--budget", str(int(cfg.get("budget_s") or DEFAULT_BUDGET_S)), "--quiet",
                   "--catalog", catalog, "--node", node, "--json"]),
         ("push", [py, "-m", "awstorage", "files", "push", "--catalog", catalog, "--node", node,
                   "--json"] + (["--api", str(cfg["api"])] if cfg.get("api") else [])),
-    )
+    ) + ((
+        # The signed GitHub inventory (inventory.py): its own transport, so it runs even
+        # when the Genesis push failed -- and its failure lands in this receipt too.
+        ("publish", [py, "-m", "awstorage", "inventory", "publish", "--catalog", catalog,
+                     "--node", node, "--json"]
+         + (["--repo", str(cfg["inventory_repo"])] if cfg.get("inventory_repo") else [])),
+    ) if publish else ())
     for name, argv in steps:
         out_f, err_f = index_dir / f"{name}.json", index_dir / f"{name}.err"
         try:
@@ -145,12 +158,20 @@ def run_pass(cfg: dict | None = None, *, run: Callable[..., Any] | None = None,
             rc = 2
             receipt["error"] = f"{name} did not start: {exc}"
         receipt[f"{name}_exit"] = rc
-        if rc != 0:
+        if rc != 0 and receipt["failed_step"] is None:
             receipt["failed_step"] = name
             receipt["error"] = receipt["error"] or _tail(err_f) or _tail(out_f) or f"exit {rc}"
             receipt["exit_code"] = rc
+        if rc != 0 and (name == "scan" or not publish):
             return _finish(receipt, index_dir)
-    receipt["exit_code"] = 0
+        if name == "publish" and rc == 0:
+            try:
+                pub = json.loads(out_f.read_text(encoding="utf-8"))
+                receipt["published"] = {k: pub.get(k) for k in ("release", "rows", "repo")}
+            except (OSError, ValueError) as exc:
+                receipt["published"] = {"unreadable": f"{out_f}: {exc}"[:200]}
+    if receipt["failed_step"] is None:
+        receipt["exit_code"] = 0
     return _finish(receipt, index_dir)
 
 
@@ -311,7 +332,17 @@ def schedule(*, every_hours: int = DEFAULT_EVERY_HOURS, index_dir: str | None = 
                           " Enrol first: adk pair <code>, or adk enroll")
         return out
     cfg = {"index_dir": str(idx), "every_hours": every_hours, "node": node,
-           "budget_s": DEFAULT_BUDGET_S, **({"api": api} if api else {})}
+           "budget_s": DEFAULT_BUDGET_S, "inventory_publish": True,
+           **({"api": api} if api else {})}
+    # The node's OWN awseal key signs its inventory (inventory.py). Made here, at
+    # enrolment, when missing -- local only; nodes/<node>.pub is committed by the first
+    # publish. No awseal installed = the publish step reports that in its receipt.
+    try:
+        from .inventory import ensure_key  # noqa: PLC0415
+        kp, made = ensure_key()
+        out["inventory_key"] = {"path": str(kp), "created": made}
+    except Exception as exc:  # noqa: BLE001 -- enrolment reports, never raises
+        out["inventory_key"] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
     path = cfg_path or config_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

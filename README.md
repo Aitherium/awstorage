@@ -370,6 +370,29 @@ locally, and only after a line for it is fsynced into the stub left in its place
 parts whose upload id is journaled, so a re-run sends only the missing parts.
 Credential paths, VM disks, database files and tenant/customer paths are refused.
 
+## Every node's inventory, signed, on GitHub (0.9.0)
+
+```bash
+pip install "awstorage[inventory]"            # awseal + awrtifact
+awstorage inventory enroll                    # once: awseal key + nodes/<node>.pub
+awstorage inventory publish                   # this node -> Aitherium/inventory
+awstorage inventory pull --all                # every node, signature-verified
+awstorage inventory query find invoice --node laptop-3
+awstorage inventory query tree D:/ --node laptop-3 --depth 2
+awstorage files tree D:/ --node laptop-3      # same answer: falls back to the pull
+```
+
+Each node publishes its OWN index as release `<node>-<UTC stamp>` in a private repo:
+the files.db rows for that node (gzipped, split under GitHub's 2 GiB asset cap by
+awrtifact), an `inventory.json` manifest, and an `awseal.json` seal made with that
+node's key. The node's public key lives in the repo as `nodes/<node>.pub`, committed
+through the contents API by `enroll` or the first publish (`files schedule`, which
+`adk pair` / `adk enroll` run, creates the key). A reader verifies against that file,
+pins the key locally, and REFUSES an unknown key, a changed key, a bad signature or
+changed bytes. Publishing to a repo that is not private needs `--allow-public`. What
+leaves the node: paths, sizes, mtimes and hashes of non-sensitive files -- never file
+content, never a hash of a credential-shaped file. Kinds are pluggable (`files` today).
+
 ## Shelf safety
 
 The harvest shelf is a drive too (E: sat at 99 %). With floors set (`--floors` on

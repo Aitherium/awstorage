@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.9.0 -- 2026-11-07
+
+Signed per-node inventories on GitHub: discovery that works with no Genesis in the path.
+
+- `inventory publish`: exports this node's rows of `files.db` into a fresh files.db (same
+  schema; sha256/head-tail hashes dropped for sensitive and never-set files; no push
+  state), gzips it, writes `inventory.json` (node, kind, release, scanned_at, rows,
+  bytes, schema), seals both with the node's OWN awseal key, splits the artifact under
+  GitHub's 2 GiB cap with awrtifact and uploads release `<node>-<UTC stamp>` (seal last)
+  plus a `<node>-latest` pointer to `Aitherium/inventory` ($AWSTORAGE_INVENTORY_REPO).
+  Refuses a repo that is not PRIVATE without `--allow-public`, and a key the registry
+  (`nodes/<node>.pub` in the repo) does not name. One awrelay line after a publish,
+  best-effort.
+- `inventory pull <node>|--all`: newest stamped release (never the pointer), every part
+  sha256-checked, the seal verified against `--key` or `nodes/<node>.pub`, that key
+  pinned locally on first use; a changed key, bad signature, changed bytes, a seal over
+  other files or a manifest naming another node/release is REFUSED and nothing is
+  cached.
+- `inventory query tree|find|dupes` answers from the verified cache with exactly the
+  `files` verbs' code and output; `files tree/find/dupes --node X` falls back to a
+  pulled inventory when the local index does not hold X (and when the remote read fails).
+- `inventory nodes [--remote]`, `inventory enroll` (awseal key + `nodes/<node>.pub`).
+- Kinds are pluggable (`inventory.register_kind`): `files` now.
+- `files sync` / `storage_index_node.sh` publish after a scan (default ON for an
+  enrolled node's config, `inventory_publish: false` / `AWSTORAGE_INVENTORY_PUBLISH=0`
+  turns it off); the publish runs even when the Genesis push failed, and its failure is
+  the receipt's `failed_step`. `files schedule` creates the node's awseal key if missing.
+
 ## 0.8.0 -- 2026-11-07
 
 Mesh auto file index: an enrolled device keeps its own index current, as the node id it

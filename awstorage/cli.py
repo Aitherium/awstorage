@@ -25,6 +25,11 @@
     awstorage files sync                    (one scan + push pass, with a receipt)
     awstorage files schedule [--every-hours N]   (install the recurring sync)
     awstorage manage revert|shares ...           (python -m awstorage.manage)
+    awstorage inventory publish [--kind files] [--repo OWNER/NAME] [--allow-public]
+    awstorage inventory pull <node>... | --all [--key HEX] [--accept-key-change]
+    awstorage inventory query tree|find|dupes [files args...] [--node ID]
+    awstorage inventory nodes [--remote] | inventory enroll
+        (signed per-node inventories in a private GitHub repo: awseal + awrtifact)
     awstorage sweep --rules agent-scratch,temp-toplevel [--policy F] [--yes]
                     [--harvest-to D] [--emergency-free-gb N] [--measure-cap-s S]
                     [--receipt PATH] [--json]
@@ -484,17 +489,46 @@ def _remote_call(a, what: str, params: dict) -> dict:
     return res if isinstance(res, dict) else {"raw": res}
 
 
+def _pulled_index(a, db=None) -> Path | None:
+    """A verified, pulled inventory that holds `--node` when this index does not
+    (`awstorage inventory pull`). None without --node, with an explicit --index, or
+    when no inventory for that node was pulled."""
+    if not getattr(a, "node", None) or getattr(a, "index", None):
+        return None
+    if db is not None and db.execute(
+            "SELECT 1 FROM roots WHERE tenant = ? AND node = ? LIMIT 1",
+            (_files.PLATFORM_TENANT, a.node)).fetchone():
+        return None
+    try:
+        from . import inventory as _inv  # noqa: PLC0415
+        return _inv.cached_index(a.node)
+    except Exception:  # noqa: BLE001 - no inventory plane is the same as no inventory
+        return None
+
+
 def _read(a, what: str, local_fn, remote_params: dict) -> dict | None:
     if _remote_wanted(a):
         try:
             return _remote_call(a, what, remote_params)
         except (GatewayError, OSError, ValueError) as exc:
-            print(f"remote {what} failed: {exc} (use --local to read this node's index)",
-                  file=sys.stderr)
-            return None
+            alt = _pulled_index(a)
+            print(f"remote {what} failed: {exc} ("
+                  + (f"answering from the pulled inventory {alt})" if alt else
+                     "use --local to read this node's index)"), file=sys.stderr)
+            if alt is None:
+                return None
+            a.index = str(alt)
     db = _files_db(a)
+    source = None
+    alt = _pulled_index(a, db)
+    if alt is not None:
+        db.close()
+        db = _files.open_index(alt)
+        source = f"inventory:{alt}"
     try:
         out = local_fn(db)
+        if source:
+            out["source"] = source
         out.update(_files.index_state(db, tenant=_files.PLATFORM_TENANT,
                                       nodes=[a.node] if a.node else None))
         return out
@@ -813,6 +847,10 @@ def _add_files_parser(sub) -> None:
     sc.add_argument("--api")
     sc.add_argument("--json", action="store_true")
     sc.set_defaults(fn=_cmd_files_schedule)
+
+#: `awstorage inventory <verb>` routes to inventory.py; any other `inventory` is the
+#: snapshot view below.
+_INVENTORY_VERBS = ("publish", "pull", "query", "nodes", "enroll")
 
 _AITHER = Path.home() / ".aither"
 
@@ -1194,6 +1232,9 @@ def main(argv: list[str] | None = None) -> int:
     _argv = list(argv) if argv is not None else sys.argv[1:]
     if _argv[:1] == ["manage"] and _argv[1:2] not in (["-h"], ["--help"]):
         return _run_manage(_argv[1:])
+    if _argv[:1] == ["inventory"] and _argv[1:2] and _argv[1] in _INVENTORY_VERBS:
+        from . import inventory as _inv  # noqa: PLC0415
+        return _inv.main(_argv[1:])
     ap = argparse.ArgumentParser(prog="awstorage", description=__doc__.split("\n\n")[0])
     ap.add_argument("--version", action="version", version=f"awstorage {__version__}")
     ap.add_argument("--self-test", action="store_true", help="prove the tool can still fail")

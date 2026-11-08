@@ -98,7 +98,7 @@ from .suggest import (
 )
 from .sweep import LIVE_IDS_ENV, SweepConfigError, presets, sweep
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 __all__ = [
     "SCHEMA_VERSION",

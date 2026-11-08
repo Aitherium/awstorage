@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "awstorage"
-version = "0.8.0"
+version = "0.9.0"
 description = "Scan a drive, get a ranked inventory of what fills it, classified re-fetchable or not, diffed against last time -- before you delete anything."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,6 +28,9 @@ harvest = ["awseal>=0.1.1", "awdit>=0.1.0", "awshare>=0.1.1"]
 # Verifying a signed decision-card answer receipt (awstorage.attest) needs awseal's
 # Ed25519 verifier. Without it every card approval is REFUSED, never waved through.
 attest = ["awseal>=0.1.1"]
+# `awstorage inventory`: the node's index sealed by awseal (its own key) and carried in
+# GitHub release assets by awrtifact. Imported lazily; without them the verbs exit 2.
+inventory = ["awseal>=0.1.2", "awrtifact>=0.4.0"]
 dev = ["pytest>=7.0", "awseal>=0.1.1"]
 
 [project.scripts]
