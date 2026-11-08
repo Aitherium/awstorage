@@ -17,17 +17,19 @@
     "awseal",
     "awshare",
     "awm",
-    "awrise"
+    "awrise",
+    "awrtifact",
+    "awrelay"
   ],
   "includes": [],
   "metrics": {
     "files": {
-      "value": 71,
-      "as_of": "2026-11-07T05:06:46+00:00"
+      "value": 77,
+      "as_of": "2026-11-07T18:44:43-08:00"
     },
     "tests": {
-      "value": 23,
-      "as_of": "2026-11-07T05:06:46+00:00"
+      "value": 26,
+      "as_of": "2026-11-07T18:44:43-08:00"
     }
   }
 }
