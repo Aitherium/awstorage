@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.1 -- 2026-11-07
+
+- Test fixtures no longer carry internal container names, so the sdist passes the publish guard.
+- Ships `scripts/check_moat_boundary.py`, the guard the publish workflow runs.
+
 ## 0.10.0 -- 2026-11-07
 
 Host inventory kinds and release retention for the signed inventory.

@@ -189,7 +189,7 @@ SC_QUERY = ("\nSERVICE_NAME: Appinfo\nDISPLAY_NAME: Application Information\n"
             "        TYPE               : 30  WIN32\n"
             "        STATE              : 4  RUNNING\n"
             "\nSERVICE_NAME: wuauserv\n        STATE              : 1  STOPPED\n")
-PODMAN = "aitheros-genesis-a\trunning\naitheros-veil\texited\n"
+PODMAN = "web-a\trunning\ndb\texited\n"
 
 
 def test_parse_nvidia_smi_csv():
@@ -217,7 +217,7 @@ def test_parse_sc_query_and_container_ps():
         {"source": "windows", "name": "Appinfo", "state": "running"},
         {"source": "windows", "name": "wuauserv", "state": "stopped"}]
     assert hi.parse_container_ps(PODMAN, "podman")[1] == {
-        "source": "podman", "name": "aitheros-veil", "state": "exited"}
+        "source": "podman", "name": "db", "state": "exited"}
 
 
 class FakeWinreg:
