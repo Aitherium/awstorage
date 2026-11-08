@@ -2,10 +2,12 @@
 repo; any other node pulls it, verifies the signature against that node's key, and
 answers queries locally. Discovery that works with no Genesis in the path.
 
-    awstorage inventory publish [--kind files] [--repo OWNER/NAME] [--allow-public]
-    awstorage inventory pull <node>... | --all [--key HEX] [--accept-key-change]
+    awstorage inventory publish [--kind files|hardware|software|services] [--keep N]
+                                [--repo OWNER/NAME] [--allow-public]
+    awstorage inventory pull <node>... | --all [--kind K] [--key HEX] [--accept-key-change]
     awstorage inventory query tree|find|dupes [args...] [--node ID]
-    awstorage inventory nodes [--remote]
+    awstorage inventory query show <node> [--kind hardware|software|services] [--json]
+    awstorage inventory nodes [--remote] [--kind K]
     awstorage inventory enroll                 (awseal key + nodes/<node>.pub, once)
 
 Composition -- nothing here is a new transport or a new signature scheme:
@@ -42,8 +44,17 @@ mounts -- and sha256 / head-tail hashes for every file NOT flagged sensitive or 
 (a key file's hash would confirm a guess of its contents). No file content, no catalog
 push state, no credentials.
 
-Kinds are pluggable (``register_kind``): ``files`` today; ``hardware``, ``software`` and
-``services`` add an exporter + a cache merger and inherit the whole signed transport.
+Kinds are pluggable (``register_kind``): ``files`` plus ``hardware``, ``software`` and
+``services`` (``host_inventory.py``: small JSON documents, no env vars / command lines /
+tokens). A non-files kind's releases are ``<node>-<kind>-<stamp>`` and
+``<node>-<kind>-latest``; ``files`` keeps ``<node>-<stamp>`` / ``<node>-latest``. A node id
+ending in ``-<kind>`` is refused so the two namings can never collide.
+
+Retention: after a successful publish the node's OWN releases of that kind older than
+the newest N (``--keep`` / ``$AWSTORAGE_INVENTORY_KEEP``, default 5) are deleted --
+never a ``-latest`` pointer, never another node's or kind's release, never a tag that
+does not match the exact ``<node>[-<kind>]-<stamp>`` shape. A failed listing deletes
+nothing; the publish result's ``retention`` names what was pruned.
 
 Exit 0 done, 1 REFUSED (the refusal is the answer), 2 could not run.
 """
@@ -74,6 +85,8 @@ DEFAULT_REPO = "Aitherium/inventory"
 REPO_ENV = "AWSTORAGE_INVENTORY_REPO"
 CACHE_ENV = "AWSTORAGE_INVENTORY_CACHE"
 ANNOUNCE_ENV = "AWSTORAGE_INVENTORY_ANNOUNCE"
+KEEP_ENV = "AWSTORAGE_INVENTORY_KEEP"
+DEFAULT_KEEP = 5
 FORMAT = "awstorage-inventory/1"
 MANIFEST_NAME = "inventory.json"
 POINTER_NAME = "latest.json"
@@ -240,6 +253,31 @@ register_kind(Kind(name="files", schema_version=1, artifact="files.db",
                    export=export_files, merge=merge_files, query_index=files_query_index))
 
 
+def _register_host_kinds() -> None:
+    from . import host_inventory as _hi  # noqa: PLC0415
+    for name in _hi.KIND_NAMES:
+        register_kind(Kind(name=name, schema_version=_hi.SCHEMA_VERSION,
+                           artifact=f"{name}.json", export=_hi.make_export(name),
+                           merge=_hi.make_merge(name),
+                           query_index=lambda d, n=name: _hi.kind_cache_dir(d, n)))
+
+
+_register_host_kinds()
+
+
+def release_prefix(node: str, kind: str = "files") -> str:
+    """``<node>-`` for files (the 0.9.0 naming, unchanged), ``<node>-<kind>-`` otherwise."""
+    return f"{node}-" if kind == "files" else f"{node}-{kind}-"
+
+
+def latest_tag(node: str, kind: str = "files") -> str:
+    return release_prefix(node, kind) + "latest"
+
+
+def _host_kind_suffixes() -> tuple[str, ...]:
+    return tuple(f"-{n}" for n in KINDS if n != "files")
+
+
 # ---------------------------------------------------------------------------
 # GitHub, through awrtifact's gh layer
 # ---------------------------------------------------------------------------
@@ -300,14 +338,36 @@ class GitHub:
     def put_file(self, repo: str, path: str, content: str, message: str) -> str:
         return str(self.gh.put_file(repo, path, content, message))
 
+    def delete_release(self, repo: str, tag: str) -> None:
+        """Delete one release AND its tag (retention). Raises on failure."""
+        if self.gh.backend() == "api":
+            from awrtifact import ghapi  # noqa: PLC0415
+            rel = ghapi._release(repo, tag)  # noqa: SLF001 - awrtifact has no delete yet
+            if rel is None:
+                return
+            ghapi._request("DELETE", f"{ghapi.API}/repos/{repo}/releases/{rel['id']}")  # noqa: SLF001
+            try:
+                ghapi._request("DELETE", f"{ghapi.API}/repos/{repo}/git/refs/tags/"  # noqa: SLF001
+                               + urllib.parse.quote(tag))
+            except ghapi.GhApiError as exc:
+                if exc.status not in (404, 422):
+                    raise
+            return
+        proc = self.gh._run(["release", "delete", tag, "--repo", repo, "--yes",  # noqa: SLF001
+                             "--cleanup-tag"])
+        if proc.returncode != 0:
+            raise InventoryError(f"gh release delete {tag}: {proc.stderr.strip()}")
+
 
 # ---------------------------------------------------------------------------
 # keys + trust
 # ---------------------------------------------------------------------------
 
 def _check_node(node: str) -> str:
-    if not node or not _NODE_RE.match(node) or node.endswith("-latest"):
-        raise InventoryError(f"not a usable node id for a release tag: {node!r}")
+    if (not node or not _NODE_RE.match(node) or node.endswith("-latest")
+            or node.endswith(_host_kind_suffixes())):
+        raise InventoryError(f"not a usable node id for a release tag: {node!r} (it may not"
+                             f" end in -latest or -<kind>)")
     return node
 
 
@@ -444,12 +504,53 @@ def announce(text: str, channel: str = "#agents",
         return f"failed: {exc}"
 
 
+def keep_count(keep: int | str | None = None) -> int:
+    """How many stamped releases retention keeps: ``keep``, else ``$AWSTORAGE_INVENTORY_KEEP``,
+    else 5. Never below 1 -- the release just published always survives."""
+    raw = keep if keep is not None else os.environ.get(KEEP_ENV)
+    try:
+        n = int(str(raw).strip()) if raw is not None and str(raw).strip() else DEFAULT_KEEP
+    except ValueError:
+        n = DEFAULT_KEEP
+    return max(1, n)
+
+
+def stamped_releases(tags: list[str], node: str, kind: str = "files") -> list[tuple[str, str]]:
+    """[(stamp, tag)] oldest first: ONLY tags that are exactly ``<prefix><stamp>``."""
+    pat = re.compile("^" + re.escape(release_prefix(node, kind)) + "(" + _STAMP_RE + ")$")
+    return sorted((m.group(1), t) for t in tags if (m := pat.match(t)))
+
+
+def prune(*, node: str, repo: str, gh: Any, kind: str = "files", keep: int | None = None,
+          protect: str | None = None) -> dict:
+    """Delete ``node``'s own ``kind`` releases older than the newest ``keep``. A listing
+    that fails deletes NOTHING; a delete that fails is reported and the rest go on."""
+    n = keep_count(keep)
+    try:
+        tags = list(gh.list_releases(repo, release_prefix(node, kind)))
+    except Exception as exc:  # noqa: BLE001 - no listing, no deletion
+        return {"keep": n, "pruned": [], "failed": [],
+                "error": f"listing failed, nothing deleted: {type(exc).__name__}: {exc}"[:300]}
+    stamped = stamped_releases(tags, node, kind)
+    doomed = [t for _, t in stamped[:-n]] if len(stamped) > n else []
+    doomed = [t for t in doomed if t not in (protect, latest_tag(node, kind))]
+    pruned, failed = [], []
+    for t in doomed:
+        try:
+            gh.delete_release(repo, t)
+            pruned.append(t)
+        except Exception as exc:  # noqa: BLE001 - one stuck release never stops the rest
+            failed.append({"release": t, "error": f"{type(exc).__name__}: {exc}"[:200]})
+    return {"keep": n, "pruned": pruned, "failed": failed,
+            "kept": [t for _, t in stamped if t not in pruned]}
+
+
 def publish(*, node: str, repo: str, src: Path, gh: Any, kind: str = "files",
             key_path: Path | None = None, allow_public: bool = False,
             work: Path | None = None, part_size: int | None = None,
             announce_channel: str | None = "#agents",
             announcer: Callable[[str, str], str] | None = None,
-            now: float | None = None) -> dict:
+            now: float | None = None, keep: int | None = None) -> dict:
     _check_node(node)
     _check_repo(repo)
     k = _kind(kind)
@@ -468,7 +569,7 @@ def publish(*, node: str, repo: str, src: Path, gh: Any, kind: str = "files",
     reg = enroll(node, repo, gh, key_path=key_path, create_key=False)
 
     stamp = time.strftime(_STAMP, time.gmtime(now if now is not None else time.time()))
-    tag = f"{node}-{stamp}"
+    tag = release_prefix(node, k.name) + stamp
     base = Path(work) if work else Path(src).parent / "tmp"
     base.mkdir(parents=True, exist_ok=True)
     wd = Path(tempfile.mkdtemp(prefix=f"inventory-{stamp}-", dir=str(base)))
@@ -509,9 +610,9 @@ def publish(*, node: str, repo: str, src: Path, gh: Any, kind: str = "files",
         gh.upload(repo, tag, sealed / MANIFEST_NAME)
         gh.upload(repo, tag, sealed / SEAL_NAME)          # last: no seal, no inventory
 
-        latest = f"{node}-latest"
+        latest = latest_tag(node, k.name)
         if not gh.release_exists(repo, latest):
-            gh.create_release(repo, latest, f"{node} latest inventory",
+            gh.create_release(repo, latest, f"{node} latest {k.name} inventory",
                               "Pointer only: latest.json names the newest release.")
         ptr = wd / POINTER_NAME
         ptr.write_text(json.dumps({"node": node, "release": tag, "kind": k.name,
@@ -521,6 +622,7 @@ def publish(*, node: str, repo: str, src: Path, gh: Any, kind: str = "files",
     finally:
         shutil.rmtree(wd, ignore_errors=True)
 
+    retention = prune(node=node, repo=repo, gh=gh, kind=k.name, keep=keep, protect=tag)
     text = (f"{node} published inventory kind={k.name} rows={stats['rows']}"
             f" release={tag}")
     relay = "disabled"
@@ -532,40 +634,47 @@ def publish(*, node: str, repo: str, src: Path, gh: Any, kind: str = "files",
     return {"ok": True, "node": node, "repo": repo, "release": tag, "kind": k.name,
             "rows": stats["rows"], "artifact_bytes": manifest["artifact_bytes"],
             "parts": len(split_manifest["parts"]), "public_key": reg["public_key"],
-            "registry_state": reg["registry_state"], "announce": relay}
+            "registry_state": reg["registry_state"], "announce": relay,
+            "retention": retention}
 
 
 # ---------------------------------------------------------------------------
 # pull
 # ---------------------------------------------------------------------------
 
-def newest_release(tags: list[str], node: str) -> str | None:
-    pat = re.compile("^" + re.escape(node) + "-(" + _STAMP_RE + ")$")
-    stamped = sorted((m.group(1), t) for t in tags if (m := pat.match(t)))
+def newest_release(tags: list[str], node: str, kind: str = "files") -> str | None:
+    stamped = stamped_releases(tags, node, kind)
     return stamped[-1][1] if stamped else None
 
 
-def remote_nodes(tags: list[str]) -> dict[str, str]:
-    """{node: newest release} from a release list."""
+def remote_nodes(tags: list[str], kind: str = "files") -> dict[str, str]:
+    """{node: newest ``kind`` release} from a release list."""
     out: dict[str, str] = {}
-    pat = re.compile("^(.+)-(" + _STAMP_RE + ")$")
+    mid = "" if kind == "files" else "-" + re.escape(kind)
+    pat = re.compile("^(.+)" + mid + "-(" + _STAMP_RE + ")$")
+    others = _host_kind_suffixes()
     for t in tags:
         m = pat.match(t)
-        if m and (m.group(1) not in out or out[m.group(1)] < t):
+        if not m or (kind == "files" and m.group(1).endswith(others)):
+            continue
+        if m.group(1) not in out or out[m.group(1)] < t:
             out[m.group(1)] = t
     return out
 
 
 def pull(*, node: str, repo: str, gh: Any, key: str | None = None,
-         accept_key_change: bool = False, release: str | None = None) -> dict:
+         accept_key_change: bool = False, release: str | None = None,
+         kind: str = "files") -> dict:
     _check_node(node)
     _check_repo(repo)
+    wanted = _kind(kind)
     aw = _need("awseal")
     from awrtifact import manifest as split_manifest_mod  # noqa: PLC0415
 
-    tag = release or newest_release(gh.list_releases(repo, f"{node}-"), node)
+    tag = release or newest_release(gh.list_releases(repo, release_prefix(node, wanted.name)),
+                                    node, wanted.name)
     if not tag:
-        raise InventoryError(f"no inventory published for {node!r} in {repo}")
+        raise InventoryError(f"no {wanted.name} inventory published for {node!r} in {repo}")
     trusted, key_src = trusted_key(node, repo, gh, key=key,
                                    accept_key_change=accept_key_change)
     root = cache_root()
@@ -621,6 +730,8 @@ def pull(*, node: str, repo: str, gh: Any, key: str | None = None,
                 raise RefusedError(f"{tag}: signed {fld} is {man.get(fld)!r}/{meta.get(fld)!r},"
                               f" expected {want!r}")
         k = _kind(str(man.get("kind") or ""))
+        if k.name != wanted.name:
+            raise RefusedError(f"{tag}: signed kind is {k.name!r}, expected {wanted.name!r}")
         if man.get("format") != FORMAT or meta.get("kind") != k.name:
             raise RefusedError(f"{tag}: unsupported format {man.get('format')!r}")
         if int(man.get("schema_version") or 0) > k.schema_version:
@@ -631,6 +742,8 @@ def pull(*, node: str, repo: str, gh: Any, key: str | None = None,
             shutil.copyfileobj(fi, fo, 1 << 20)
         k.merge(raw, node, root)
         nd = root / "nodes" / node
+        if k.name != "files":
+            nd = nd / k.name
         nd.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(sealed / MANIFEST_NAME, nd / MANIFEST_NAME)
         shutil.copyfile(sealed / SEAL_NAME, nd / SEAL_NAME)
@@ -658,6 +771,12 @@ def cached_nodes() -> list[dict]:
             except (OSError, ValueError):
                 continue
     return out
+
+
+def cached_kinds(node: str) -> list[str]:
+    """The non-files kinds pulled (verified) for ``node``."""
+    d = cache_root() / "nodes" / node
+    return sorted(k for k in KINDS if k != "files" and (d / k / "pulled.json").is_file())
 
 
 def cached_index(node: str | None = None, kind: str = "files") -> Path | None:
@@ -718,6 +837,9 @@ def main(argv: list[str], gh_factory: Callable[[], Any] = GitHub) -> int:
                     help="publish to a repo that is not private (paths become public)")
     pb.add_argument("--work", help="scratch dir (default: beside the index)")
     pb.add_argument("--part-size", type=int)
+    pb.add_argument("--keep", type=int,
+                    help=f"stamped releases of this node+kind to keep (default ${KEEP_ENV}"
+                         f" or {DEFAULT_KEEP})")
     pb.add_argument("--announce-channel", default="#agents")
     pb.add_argument("--no-announce", action="store_true")
     common(pb)
@@ -728,10 +850,12 @@ def main(argv: list[str], gh_factory: Callable[[], Any] = GitHub) -> int:
     pl.add_argument("--key", help="trust exactly this public key (hex) for the node")
     pl.add_argument("--release", help="a specific release instead of the newest")
     pl.add_argument("--accept-key-change", action="store_true")
+    pl.add_argument("--kind", default="files", choices=sorted(KINDS))
     common(pl)
 
     nd = sub.add_parser("nodes", help="pulled inventories (or --remote: what the repo has)")
     nd.add_argument("--remote", action="store_true")
+    nd.add_argument("--kind", default="files", choices=sorted(KINDS))
     common(nd)
 
     en = sub.add_parser("enroll", help="create the awseal key if missing; commit"
@@ -748,20 +872,23 @@ def _dispatch(a, gh_factory) -> int:
     repo = _default_repo(a)
     if a.verb == "nodes" and not a.remote:
         rows = cached_nodes()
+        for r in rows:
+            r["kinds"] = cached_kinds(r["node"])
         if a.json:
             print(json.dumps({"nodes": rows}, indent=1))
         for r in [] if a.json else rows:
             print(f"{r['node']:<20} {r.get('rows')} rows  {r['release']}  verified"
-                  f" {r['verified_at']}  key {r['public_key'][:16]}... ({r['key_source']})")
+                  f" {r['verified_at']}  key {r['public_key'][:16]}... ({r['key_source']})"
+                  + (f"  +{','.join(r['kinds'])}" if r["kinds"] else ""))
         if not rows and not a.json:
             print("no inventories pulled yet -- run: awstorage inventory pull --all")
         return 0
     gh = gh_factory()
     if a.verb == "nodes":
-        latest = remote_nodes(gh.list_releases(repo, ""))
-        _emit(a, {"repo": repo, "nodes": latest},
+        latest = remote_nodes(gh.list_releases(repo, ""), a.kind)
+        _emit(a, {"repo": repo, "kind": a.kind, "nodes": latest},
               "\n".join(f"{n:<20} {t}" for n, t in sorted(latest.items()))
-              or f"{repo} has no inventories")
+              or f"{repo} has no {a.kind} inventories")
         return 0
     if a.verb == "enroll":
         res = enroll(_check_node(a.node or whoami()), repo, gh, key_path=key_path_for(a.key))
@@ -772,14 +899,20 @@ def _dispatch(a, gh_factory) -> int:
         res = publish(node=a.node or whoami(), repo=repo, src=_src_index(a), gh=gh,
                       kind=a.kind, key_path=key_path_for(a.key), allow_public=a.allow_public,
                       work=Path(a.work) if a.work else None, part_size=a.part_size,
-                      announce_channel=None if a.no_announce else a.announce_channel)
+                      announce_channel=None if a.no_announce else a.announce_channel,
+                      keep=a.keep)
+        ret = res["retention"]
         _emit(a, res, f"published {res['node']} {res['kind']}: {res['rows']} rows ->"
                       f" {repo}@{res['release']} ({res['parts']} part(s),"
-                      f" {res['artifact_bytes']} bytes; relay {res['announce']})")
+                      f" {res['artifact_bytes']} bytes; relay {res['announce']});"
+                      f" retention keep {ret['keep']}: pruned {len(ret['pruned'])}"
+                      + (f" ({', '.join(ret['pruned'])})" if ret["pruned"] else "")
+                      + (f"; {ret['error']}" if ret.get("error") else "")
+                      + (f"; {len(ret['failed'])} delete(s) failed" if ret["failed"] else ""))
         return 0
     nodes = list(a.node or [])
     if a.all:
-        nodes += sorted(remote_nodes(gh.list_releases(repo, "")))
+        nodes += sorted(remote_nodes(gh.list_releases(repo, ""), a.kind))
     if not nodes:
         raise InventoryError("name a node or pass --all")
     if a.key and len(nodes) != 1:
@@ -788,9 +921,9 @@ def _dispatch(a, gh_factory) -> int:
     for n in dict.fromkeys(nodes):
         try:
             r = pull(node=n, repo=repo, gh=gh, key=a.key, release=a.release,
-                     accept_key_change=a.accept_key_change)
+                     accept_key_change=a.accept_key_change, kind=a.kind)
             if not a.json:
-                print(f"verified {n}: {r['rows']} rows from {r['release']}"
+                print(f"verified {n} {a.kind}: {r['rows']} rows from {r['release']}"
                       f" (key {r['public_key'][:16]}... via {r['key_source']})")
         except InventoryError as exc:
             r = {"ok": False, "node": n, "error": str(exc), "refused": exc.code == 1}
@@ -807,8 +940,11 @@ def _dispatch(a, gh_factory) -> int:
 def _query(rest: list[str]) -> int:
     """``inventory query tree|find|dupes ...`` = ``files <verb> ...`` against the
     verified cache: the same code and the same output as the local index."""
+    if rest[:1] == ["show"]:
+        return _query_show(rest[1:])
     if not rest or rest[0] not in ("tree", "find", "dupes"):
-        print("usage: awstorage inventory query tree|find|dupes [files args...] [--node ID]",
+        print("usage: awstorage inventory query tree|find|dupes [files args...] [--node ID]\n"
+              "       awstorage inventory query show <node> [--kind K] [--json]",
               file=sys.stderr)
         return 2
     idx = cached_index()
@@ -818,3 +954,27 @@ def _query(rest: list[str]) -> int:
         return 2
     from .cli import main as cli_main  # noqa: PLC0415
     return int(cli_main(["files", rest[0], *rest[1:], "--index", str(idx), "--local"]))
+
+
+def _query_show(rest: list[str]) -> int:
+    """``inventory query show <node> [--kind hardware|software|services] [--json]``: the
+    verified, pulled host documents for a node (every pulled kind when --kind is absent)."""
+    from . import host_inventory as _hi  # noqa: PLC0415
+    ap = argparse.ArgumentParser(prog="awstorage inventory query show")
+    ap.add_argument("node")
+    ap.add_argument("--kind", choices=list(_hi.KIND_NAMES))
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(rest)
+    kinds = [a.kind] if a.kind else list(_hi.KIND_NAMES)
+    docs = {k: d for k in kinds
+            if (d := _hi.cached_doc(cache_root(), k, a.node)) is not None}
+    if not docs:
+        want = a.kind or "hardware|software|services"
+        print(f"no {want} inventory pulled for {a.node!r} -- run: awstorage inventory pull"
+              f" {a.node} --kind {a.kind or 'hardware'}", file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(docs[a.kind] if a.kind else docs, indent=1))
+    else:
+        print("\n".join(_hi.render(d) for d in docs.values()))
+    return 0

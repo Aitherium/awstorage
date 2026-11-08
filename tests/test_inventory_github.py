@@ -291,7 +291,8 @@ def _runner(codes: dict, calls: list):
 
 
 def test_sync_publishes_after_push_and_surfaces_a_publish_failure(tmp_path):
-    cfg = {"index_dir": str(tmp_path / "i"), "node": NODE, "inventory_publish": True}
+    cfg = {"index_dir": str(tmp_path / "i"), "node": NODE, "inventory_publish": True,
+           "inventory_kinds": False}
     calls: list = []
     rec = autoindex.run_pass(cfg, run=_runner({}, calls), python="py")
     assert calls == ["scan", "push", "publish"] and rec["exit_code"] == 0

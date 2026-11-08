@@ -25,10 +25,11 @@
     awstorage files sync                    (one scan + push pass, with a receipt)
     awstorage files schedule [--every-hours N]   (install the recurring sync)
     awstorage manage revert|shares ...           (python -m awstorage.manage)
-    awstorage inventory publish [--kind files] [--repo OWNER/NAME] [--allow-public]
+    awstorage inventory publish [--kind files|hardware|software|services] [--keep N]
     awstorage inventory pull <node>... | --all [--key HEX] [--accept-key-change]
     awstorage inventory query tree|find|dupes [files args...] [--node ID]
-    awstorage inventory nodes [--remote] | inventory enroll
+    awstorage inventory query show <node> [--kind hardware|software|services] [--json]
+    awstorage inventory nodes [--remote] [--kind K] | inventory enroll
         (signed per-node inventories in a private GitHub repo: awseal + awrtifact)
     awstorage sweep --rules agent-scratch,temp-toplevel [--policy F] [--yes]
                     [--harvest-to D] [--emergency-free-gb N] [--measure-cap-s S]

@@ -393,6 +393,33 @@ changed bytes. Publishing to a repo that is not private needs `--allow-public`. 
 leaves the node: paths, sizes, mtimes and hashes of non-sensitive files -- never file
 content, never a hash of a credential-shaped file. Kinds are pluggable (`files` today).
 
+### Hardware, software, services -- and retention (0.10.0)
+
+```bash
+awstorage inventory publish --kind hardware   # CPU, RAM, GPUs (nvidia-smi), disks, OS
+awstorage inventory publish --kind software   # winreg Uninstall / dpkg-query / macOS apps + pip
+awstorage inventory publish --kind services   # systemd / Windows services, podman/docker ps
+awstorage inventory pull laptop-3 --kind hardware
+awstorage inventory query show laptop-3 --kind hardware [--json]
+awstorage inventory nodes --remote --kind software
+```
+
+Each host kind is one small JSON document on the same signed transport, released as
+`<node>-<kind>-<stamp>` + `<node>-<kind>-latest` (`files` keeps `<node>-<stamp>`; a node
+id ending in `-<kind>` is refused so the namings never collide). Names, versions and
+states only: no environment variables, command lines, unit descriptions or container
+images, and every kept string passes a secret scrubber. A missing or failing tool
+(`nvidia-smi`, `dpkg-query`, `systemctl`, `podman` ...) is a row of `unavailable`, never a
+failed publish. `files sync` publishes the three kinds at most once per 24 h each
+(`$AWSTORAGE_INVENTORY_KINDS_EVERY_S`, state in `<index_dir>/inventory_kinds.json`;
+`inventory_kinds: false` in the config turns it off).
+
+Retention: after every successful publish the node's own releases of that kind older
+than the newest N are deleted with their tags (`--keep N`, `$AWSTORAGE_INVENTORY_KEEP`,
+default 5). Never a `-latest` pointer, never another node's or kind's release, never a
+tag that is not exactly `<node>[-<kind>]-<stamp>`; a failed listing deletes nothing. The
+publish result's `retention` names what was pruned.
+
 ## Shelf safety
 
 The harvest shelf is a drive too (E: sat at 99 %). With floors set (`--floors` on

@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.10.0 -- 2026-11-07
+
+Host inventory kinds and release retention for the signed inventory.
+
+- `inventory publish --kind hardware|software|services` (`host_inventory.py`, stdlib;
+  psutil used when present): hardware = hostname, OS/kernel, CPU model/cores, RAM, GPUs
+  via `nvidia-smi`, disks/volumes (size, free, fs); software = Windows Uninstall keys
+  (winreg: DisplayName/Version/Publisher only), `dpkg-query` (or `rpm`), macOS
+  `system_profiler` apps, plus the running interpreter's pip distributions; services =
+  systemd units / Windows services (name + state) and `podman`/`docker ps` (name + state).
+  No env vars, command lines, descriptions or images; every string is secret-scrubbed. A
+  missing/failing/hanging tool is recorded in `unavailable`, never raised.
+- Releases `<node>-<kind>-<stamp>` + `<node>-<kind>-latest`; `files` naming unchanged. Node
+  ids ending in `-hardware`/`-software`/`-services` are refused.
+- `inventory pull --kind K`, `inventory nodes --remote --kind K`,
+  `inventory query show <node> [--kind K] [--json]`; a pull refuses a release whose signed
+  kind is not the one asked for.
+- Retention after every successful publish: keep the newest N (`--keep`,
+  `$AWSTORAGE_INVENTORY_KEEP`, default 5) of the node's own releases of that kind, delete
+  the rest with their tags; never `-latest`, another node/kind, or an off-pattern tag; a
+  failed listing deletes nothing; reported as `retention` in the publish result.
+- `files sync` publishes the three host kinds at most once per 24 h each
+  (`$AWSTORAGE_INVENTORY_KINDS_EVERY_S`, `<index_dir>/inventory_kinds.json`); outcomes in
+  the receipt's `kinds`, a failure retried next pass and never failing the files pass.
+
 ## 0.9.0 -- 2026-11-07
 
 Signed per-node inventories on GitHub: discovery that works with no Genesis in the path.

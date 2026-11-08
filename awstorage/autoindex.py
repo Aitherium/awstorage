@@ -37,6 +37,13 @@ DEFAULT_BUDGET_S = 5400
 LOW_SYSTEM_FREE_BYTES = 30 * 1024 ** 3
 #: An alternative volume must have at least this much free to be worth moving to.
 MIN_ALT_FREE_BYTES = 50 * 1024 ** 3
+#: The host inventory kinds a pass publishes on a SLOWER cadence than files: at most
+#: once per KINDS_EVERY_S each (``$AWSTORAGE_INVENTORY_KINDS_EVERY_S``), tracked in
+#: ``<index_dir>/inventory_kinds.json`` -- a failed kind publish is retried next pass.
+HOST_KINDS = ("hardware", "software", "services")
+KINDS_EVERY_ENV = "AWSTORAGE_INVENTORY_KINDS_EVERY_S"
+DEFAULT_KINDS_EVERY_S = 24 * 3600
+KINDS_STATE = "inventory_kinds.json"
 
 
 def config_path() -> Path:
@@ -170,9 +177,76 @@ def run_pass(cfg: dict | None = None, *, run: Callable[..., Any] | None = None,
                 receipt["published"] = {k: pub.get(k) for k in ("release", "rows", "repo")}
             except (OSError, ValueError) as exc:
                 receipt["published"] = {"unreadable": f"{out_f}: {exc}"[:200]}
+    if publish and cfg.get("inventory_kinds", True):
+        receipt["kinds"] = _publish_kinds(cfg, index_dir, catalog, node, py, run, env)
     if receipt["failed_step"] is None:
         receipt["exit_code"] = 0
     return _finish(receipt, index_dir)
+
+
+def kinds_every_s() -> int:
+    try:
+        return max(0, int(os.environ.get(KINDS_EVERY_ENV) or DEFAULT_KINDS_EVERY_S))
+    except ValueError:
+        return DEFAULT_KINDS_EVERY_S
+
+
+def kinds_due(index_dir: Path, now: float | None = None) -> list[str]:
+    """The host kinds whose last SUCCESSFUL publish is older than the cadence."""
+    now = time.time() if now is None else now
+    try:
+        state = json.loads((index_dir / KINDS_STATE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+    every = kinds_every_s()
+    out = []
+    for k in HOST_KINDS:
+        last = state.get(k) if isinstance(state, dict) else None
+        if not isinstance(last, (int, float)) or now - float(last) >= every:
+            out.append(k)
+    return out
+
+
+def _publish_kinds(cfg: dict, index_dir: Path, catalog: str, node: str, py: str,
+                   run: Callable[..., Any], env: dict) -> dict:
+    """hardware / software / services, each when due. Never fails the files pass: each
+    outcome is in the receipt and only a success moves that kind's timestamp."""
+    out: dict = {}
+    due = kinds_due(index_dir)
+    try:
+        state = json.loads((index_dir / KINDS_STATE).read_text(encoding="utf-8"))
+        state = state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        state = {}
+    for k in HOST_KINDS:
+        if k not in due:
+            out[k] = {"skipped": "not due", "last": state.get(k)}
+            continue
+        argv = ([py, "-m", "awstorage", "inventory", "publish", "--kind", k, "--catalog",
+                 catalog, "--node", node, "--json"]
+                + (["--repo", str(cfg["inventory_repo"])] if cfg.get("inventory_repo") else []))
+        out_f, err_f = index_dir / f"publish-{k}.json", index_dir / f"publish-{k}.err"
+        try:
+            with open(out_f, "wb") as so, open(err_f, "wb") as se:
+                rc = int(run(argv, stdout=so, stderr=se, env=env).returncode)
+        except OSError as exc:
+            out[k] = {"exit": 2, "error": f"did not start: {exc}"[:300]}
+            continue
+        if rc != 0:
+            out[k] = {"exit": rc, "error": _tail(err_f) or _tail(out_f) or f"exit {rc}"}
+            continue
+        try:
+            pub = json.loads(out_f.read_text(encoding="utf-8"))
+            out[k] = {"exit": 0, "release": pub.get("release"), "rows": pub.get("rows"),
+                      "pruned": (pub.get("retention") or {}).get("pruned")}
+        except (OSError, ValueError) as exc:
+            out[k] = {"exit": 0, "unreadable": f"{out_f}: {exc}"[:200]}
+        state[k] = time.time()
+    try:
+        (index_dir / KINDS_STATE).write_text(json.dumps(state) + "\n", encoding="utf-8")
+    except OSError as exc:
+        out["state_error"] = str(exc)[:200]
+    return out
 
 
 def _finish(receipt: dict, index_dir: Path) -> dict:
