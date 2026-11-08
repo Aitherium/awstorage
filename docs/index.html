@@ -440,6 +440,9 @@ awstorage revert  E:/.awstorage-quarantine/3-20260901T230000            # change
    copies a manage action could really reclaim. Rescans are incremental: only files
    whose size, mtime or hash changed are written (each takes a new <code>seq</code>); files a
    COMPLETED walk no longer sees become tombstones; a truncated walk deletes nothing.
+   On Windows NTFS a repeat scan reads the USN change journal since the last walk and
+   re-reads only the directories it names -- no admin needed; any doubt is a full walk,
+   and the scan JSON says which (<code>mode</code>, <code>usn_fallback_reason</code>).
    Credential-shaped files (<code>.ssh</code>, <code>.env*</code>, <code>*.pem</code>, ...) are indexed but flagged and
    redacted for any non-platform reader (<code>awstorage.guards</code>).</li>
 </ol>
@@ -737,6 +740,27 @@ locally, and only after a line for it is fsynced into the stub left in its place
 (<code>AWOFFLOADED.jsonl</code>), which is also copied to the bucket. A large file uploads in
 parts whose upload id is journaled, so a re-run sends only the missing parts.
 Credential paths, VM disks, database files and tenant/customer paths are refused.</p>
+<h2>Every node's inventory, signed, on GitHub (0.9.0)</h2>
+
+<pre><code>```bash
+pip install &quot;awstorage[inventory]&quot;            # awseal + awrtifact
+awstorage inventory enroll                    # once: awseal key + nodes/&lt;node&gt;.pub
+awstorage inventory publish                   # this node -&gt; Aitherium/inventory
+awstorage inventory pull --all                # every node, signature-verified
+awstorage inventory query find invoice --node laptop-3
+awstorage inventory query tree D:/ --node laptop-3 --depth 2
+awstorage files tree D:/ --node laptop-3      # same answer: falls back to the pull
+</code></pre>
+<p>Each node publishes its OWN index as release <code>&lt;node&gt;-&lt;UTC stamp&gt;</code> in a private repo:
+the files.db rows for that node (gzipped, split under GitHub's 2 GiB asset cap by
+awrtifact), an <code>inventory.json</code> manifest, and an <code>awseal.json</code> seal made with that
+node's key. The node's public key lives in the repo as <code>nodes/&lt;node&gt;.pub</code>, committed
+through the contents API by <code>enroll</code> or the first publish (<code>files schedule</code>, which
+<code>adk pair</code> / <code>adk enroll</code> run, creates the key). A reader verifies against that file,
+pins the key locally, and REFUSES an unknown key, a changed key, a bad signature or
+changed bytes. Publishing to a repo that is not private needs <code>--allow-public</code>. What
+leaves the node: paths, sizes, mtimes and hashes of non-sensitive files -- never file
+content, never a hash of a credential-shaped file. Kinds are pluggable (<code>files</code> today).</p>
 <h2>Shelf safety</h2>
 <p>The harvest shelf is a drive too (E: sat at 99 %). With floors set (<code>--floors</code> on
 <code>sweep</code>, <code>$AWSTORAGE_FLOORS</code> for <code>apply-suggestions</code>), an item whose harvest would be
