@@ -3,9 +3,16 @@
 `whoami()` is the ONE place a node id comes from, in this order:
 
 1. ``AWSTORAGE_NODE`` (a scheduler or a test pins it);
-2. ``~/.aither/node-id`` (written at enroll or host setup; the platform host
-   writes ``local``);
-3. the hostname.
+2. ``~/.aither/node-id`` (host setup; the platform host writes ``local``);
+3. the id this device REGISTERED with: ``~/.aither/node_auth.json`` ``node_id``
+   (``adk pair`` / ``adk enroll`` -- the install door), else ``AITHER_NODE_ID`` in the
+   ``node-token`` file ``bootstrap/join.sh`` writes (``/etc/aitheros`` or the per-user
+   ``~/.config/aitheros``);
+4. the hostname -- only when the device never enrolled.
+
+Step 3 exists because nothing wrote ``node-id`` at enroll: every enrolled laptop
+indexed itself under its HOSTNAME, a name no registry knows, and Genesis refused the
+push ("not in your scope"). The registered id is the one the node's credential names.
 
 Every CLI verb uses it; nothing else calls ``socket.gethostname()`` for a node id.
 
@@ -15,6 +22,7 @@ Every CLI verb uses it; nothing else calls ``socket.gethostname()`` for a node i
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import re
@@ -24,6 +32,53 @@ from pathlib import Path
 
 NODE_ID_FILE = Path.home() / ".aither" / "node-id"
 _NODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def credential_files(node_id_file: Path | None = None) -> list[Path]:
+    """Where an enrolled device keeps its registration, in lookup order. Relative to the
+    ``node-id`` file's directory (``~/.aither``), plus join.sh's ``node-token`` locations
+    when that directory is the default one."""
+    base = (node_id_file or NODE_ID_FILE).parent
+    out = [base / "node_auth.json"]
+    if node_id_file is None:
+        xdg = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+        out += [Path("/etc/aitheros/node-token"), xdg / "aitheros" / "node-token"]
+    return out
+
+
+def read_registration(path: Path) -> dict:
+    """{"node_id", "token", "tenant_id"} from one credential file ({} when absent or
+    unreadable). node_auth.json is JSON; join.sh's node-token is KEY=VALUE lines."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    if path.name.endswith(".json"):
+        try:
+            d = json.loads(text)
+        except ValueError:
+            return {}
+        if not isinstance(d, dict):
+            return {}
+        return {"node_id": str(d.get("node_id") or "").strip(),
+                "token": str(d.get("bearer_token") or "").strip(),
+                "tenant_id": str(d.get("tenant_id") or "").strip()}
+    kv = {}
+    for line in text.splitlines():
+        k, sep, v = line.partition("=")
+        if sep:
+            kv[k.strip()] = v.strip()
+    return {"node_id": kv.get("AITHER_NODE_ID", ""), "token": kv.get("AITHER_NODE_TOKEN", ""),
+            "tenant_id": ""}
+
+
+def registered_node(node_id_file: Path | None = None) -> tuple[str, str]:
+    """(node_id, source file) of the first enrolled registration found, ("", "") if none."""
+    for f in credential_files(node_id_file):
+        nid = read_registration(f).get("node_id", "")
+        if nid and _NODE_RE.match(nid):
+            return nid, str(f)
+    return "", ""
 
 
 def whoami(node_id_file: Path | None = None) -> str:
@@ -38,7 +93,8 @@ def whoami(node_id_file: Path | None = None) -> str:
         text = ""
     if text and _NODE_RE.match(text):
         return text
-    return socket.gethostname()
+    nid, _src = registered_node(node_id_file)
+    return nid or socket.gethostname()
 
 
 def whoami_source(node_id_file: Path | None = None) -> str:
@@ -50,7 +106,8 @@ def whoami_source(node_id_file: Path | None = None) -> str:
             return f"file:{f}"
     except OSError:
         pass
-    return "hostname"
+    _nid, src = registered_node(node_id_file)
+    return f"registration:{src}" if src else "hostname"
 
 
 _PSEUDO_FS = frozenset({

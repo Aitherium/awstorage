@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.8.0 -- 2026-11-07
+
+Mesh auto file index: an enrolled device keeps its own index current, as the node id it
+registered with, pushed with its own token.
+
+- `whoami` uses the id the device REGISTERED with (`~/.aither/node_auth.json` from
+  `adk pair`/`adk enroll`, or join.sh's `node-token`) before the hostname. An enrolled
+  device used to index itself under its hostname, which no registry knows, so Genesis
+  refused its push.
+- `files push --node-token`: a remote device pushes its own index to the public API
+  (`POST /v1/storage/files/{node}`) with its enrolment token -- the default when the
+  machine has no gateway route. Genesis binds the write to the token's tenant and node;
+  the client refuses to push for any other node and never sends a credential over http.
+- `files sync`: one scan-every-volume + push pass with a `last_run.json` receipt on every
+  path; a failed scan or push exits non-zero naming the step and its stderr.
+- `files schedule`: registers that pass as an awrise wake, else a Windows scheduled task,
+  a systemd user timer, a launchd agent or a cron line; puts the index off a system drive
+  with under 30 GiB free. Refuses a device that never enrolled.
+
 ## 0.7.0 -- 2026-11-07
 
 `files scan` is incremental on Windows NTFS. After a completed walk the root keeps a

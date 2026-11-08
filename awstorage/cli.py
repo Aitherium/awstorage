@@ -21,7 +21,9 @@
     awstorage files dupes [--min-bytes N] [--node ID] [--local|--remote] [--json]
     awstorage files tree [<path>] [--depth 2] [--node ID] [--local|--remote] [--json]
     awstorage files nodes [--json]
-    awstorage files push [--node ID] [--gateway URL] [--bearer-file F]
+    awstorage files push [--node ID] [--gateway URL] [--bearer-file F] [--node-token]
+    awstorage files sync                    (one scan + push pass, with a receipt)
+    awstorage files schedule [--every-hours N]   (install the recurring sync)
     awstorage manage revert|shares ...           (python -m awstorage.manage)
     awstorage sweep --rules agent-scratch,temp-toplevel [--policy F] [--yes]
                     [--harvest-to D] [--emergency-free-gb N] [--measure-cap-s S]
@@ -615,12 +617,39 @@ def _cmd_files_nodes(a) -> int:
     return 0
 
 
+def _push_via_node_token(a) -> bool:
+    """The transport: the device's OWN enrolment token straight to the public API when
+    asked (--node-token / --api), or when this machine has no gateway route at all (no
+    --gateway, no AWSTORAGE_GATEWAY, no session bearer) -- i.e. every remote device. The
+    platform host keeps its loopback gateway push unchanged."""
+    if getattr(a, "node_token", False) or getattr(a, "api", None):
+        return True
+    if a.gateway or a.bearer_file or os.environ.get("AWSTORAGE_GATEWAY"):
+        return False
+    from .remote import DEFAULT_BEARER_FILE  # noqa: PLC0415
+    return not DEFAULT_BEARER_FILE.is_file()
+
+
 def _cmd_files_push(a) -> int:
-    node = a.node or whoami()
+    from .remote import NodeTokenClient, load_node_credential  # noqa: PLC0415
+
+    try:
+        if _push_via_node_token(a):
+            cred = load_node_credential()
+            if a.node and a.node != cred["node_id"]:
+                raise GatewayError(f"this device enrolled as {cred['node_id']!r}; its"
+                                   f" credential cannot push for {a.node!r}")
+            node = cred["node_id"]
+            client = NodeTokenClient(node, cred["token"], base_url=a.api)
+        else:
+            node = a.node or whoami()
+            client = GatewayClient(base_url=a.gateway,
+                                   bearer_file=Path(a.bearer_file) if a.bearer_file else None)
+    except GatewayError as exc:
+        print(f"REFUSED: {exc}")
+        return 1
     db = _files_db(a)
     try:
-        client = GatewayClient(base_url=a.gateway,
-                               bearer_file=Path(a.bearer_file) if a.bearer_file else None)
         client.connect()
         res = push_files(client, db, node, volumes=list_volumes(), roots=a.root or None)
     except GatewayError as exc:
@@ -637,6 +666,34 @@ def _cmd_files_push(a) -> int:
               f"{r['unchanged']} unchanged, {r['rejected']} rejected, {r['pruned']} pruned "
               f"in {r['parts']} part(s)" + (f"  [job {r['job_id']}]" if r["job_id"] else ""))
     return 0
+
+
+def _cmd_files_sync(a) -> int:
+    from . import autoindex  # noqa: PLC0415
+
+    cfg = autoindex.load_config(Path(a.config) if a.config else None)
+    if a.index_dir:
+        cfg["index_dir"] = a.index_dir
+    rec = autoindex.run_pass(cfg)
+    print(json.dumps(rec, indent=1) if a.json else
+          (f"file index ok: {rec['node']} -> {rec['index_dir']}" if rec["exit_code"] == 0
+           else f"file index FAILED at {rec['failed_step']} for {rec['node']}:"
+                f" {rec['error']}"))
+    return int(rec["exit_code"])
+
+
+def _cmd_files_schedule(a) -> int:
+    from . import autoindex  # noqa: PLC0415
+
+    out = autoindex.schedule(every_hours=a.every_hours, index_dir=a.index_dir, api=a.api)
+    if a.json:
+        print(json.dumps(out, indent=1))
+    elif out.get("ok"):
+        print(f"file index scheduled ({out['scheduler']}, every {out['every_hours']}h) for"
+              f" node {out['node']} -> {out['index_dir']} ({out['index_dir_reason']})")
+    else:
+        print(f"file index NOT scheduled: {out.get('detail')}")
+    return 0 if out.get("ok") else 1
 
 
 def _cmd_files_help(a) -> int:
@@ -734,9 +791,28 @@ def _add_files_parser(sub) -> None:
     p = fsub.add_parser("push", help="push this node's index to Genesis (delta, chunked)")
     p.add_argument("--gateway")
     p.add_argument("--bearer-file")
+    p.add_argument("--node-token", action="store_true",
+                   help="push with this device's enrolment token to the public API (the"
+                        " default when there is no gateway route)")
+    p.add_argument("--api", help="public API base for --node-token (default:"
+                                 " $AWSTORAGE_API or https://api.aitherium.com)")
     p.add_argument("--root", action="append", help="only this indexed root (repeatable)")
     common(p)
     p.set_defaults(fn=_cmd_files_push)
+
+    sy = fsub.add_parser("sync", help="one scheduled pass: scan every volume, push, receipt")
+    sy.add_argument("--config", help="default: ~/.aither/awstorage-autoindex.json")
+    sy.add_argument("--index-dir")
+    sy.add_argument("--json", action="store_true")
+    sy.set_defaults(fn=_cmd_files_sync)
+
+    sc = fsub.add_parser("schedule", help="install the recurring sync (awrise, else the"
+                                          " OS scheduler) -- enrolment runs this")
+    sc.add_argument("--every-hours", type=int, default=6)
+    sc.add_argument("--index-dir", help="default: off the system drive when it is low")
+    sc.add_argument("--api")
+    sc.add_argument("--json", action="store_true")
+    sc.set_defaults(fn=_cmd_files_schedule)
 
 _AITHER = Path.home() / ".aither"
 

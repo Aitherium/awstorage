@@ -468,7 +468,98 @@ def _push_root(client: GatewayClient, db: Any, node_id: str, root: dict,
     raise GatewayError(f"{node_id}:{root['root']}: resync loop")  # pragma: no cover
 
 
-def push_files(client: GatewayClient, db: Any, node_id: str, *,
+# ---------------------------------------------------------------------------
+# node-token transport -- a REMOTE device pushes its own index
+# ---------------------------------------------------------------------------
+#
+# The MCP gateway above listens on the platform host's loopback only, so a laptop, the
+# OptiPlex or the DGX could never push its own index (2026-11-07: the DGX's files.db had
+# to be copied to the host and pushed from there). A device pushes the way it already
+# reports everything else: to the public API, with the capability token it was handed
+# when it enrolled (``adk pair``/``adk enroll`` -> ~/.aither/node_auth.json
+# ``bearer_token``; ``bootstrap/join.sh`` -> ``node-token``). Genesis binds the write to
+# the TOKEN's tenant and node (routers/storage.py ``_ingest_scope``): this client never
+# sends a tenant, and it refuses to push for any node but the one its credential names.
+
+DEFAULT_API_URL = os.environ.get("AWSTORAGE_API", "https://api.aitherium.com")
+NODE_FILES_PATH = "/v1/storage/files/"
+
+
+def load_node_credential(node_id_file: Path | None = None) -> dict:
+    """{"node_id", "token", "source"} of this device's enrollment; GatewayError if it has
+    none (a device that never enrolled has nothing to push AS)."""
+    from .identity import credential_files, read_registration  # noqa: PLC0415
+
+    for f in credential_files(node_id_file):
+        reg = read_registration(f)
+        if reg.get("node_id") and reg.get("token"):
+            return {"node_id": reg["node_id"], "token": reg["token"], "source": str(f)}
+    raise GatewayError("this device holds no enrollment credential (node_auth.json /"
+                       " node-token) -- enrol it first: adk pair <code>, or adk enroll")
+
+
+class NodeTokenClient:
+    """The `call_tool` surface `push_files` uses, over HTTPS to the public API with the
+    device's own token. Only `storage_ingest_files` is carried -- a node pushes its index
+    and does nothing else through here."""
+
+    def __init__(self, node_id: str, token: str, base_url: str | None = None,
+                 timeout_s: float = 120.0, opener: Any = None) -> None:
+        if not node_id or not token:
+            raise GatewayError("node-token push needs the node id AND its token")
+        self.node_id = node_id
+        self._token = token
+        self.base_url = (base_url or DEFAULT_API_URL).rstrip("/")
+        if not self.base_url.lower().startswith("https://"):
+            raise GatewayError(f"refusing to send a node credential over {self.base_url!r}"
+                               " -- the API must be https")
+        self.timeout_s = timeout_s
+        self._ctx = _ssl_context(self.base_url)
+        self._open = opener or urllib.request.urlopen
+
+    def connect(self) -> "NodeTokenClient":
+        return self
+
+    def call_tool(self, name: str, arguments: dict) -> Any:
+        import urllib.parse  # noqa: PLC0415
+
+        if name != "storage_ingest_files":
+            raise GatewayError(f"{name}: the node-token transport carries only index pushes")
+        node = str(arguments.get("node_id") or "")
+        if node != self.node_id:
+            raise GatewayError(f"this credential is for node {self.node_id!r}; refusing to"
+                               f" push as {node!r}")
+        url = self.base_url + NODE_FILES_PATH + urllib.parse.quote(node, safe="")
+        req = urllib.request.Request(
+            url, data=str(arguments.get("body_json") or "{}").encode("utf-8"), method="POST",
+            headers={"Authorization": f"Bearer {self._token}",
+                     "Content-Type": "application/json",
+                     "User-Agent": f"awstorage/{__version__}"})
+        try:
+            with self._open(req, timeout=self.timeout_s, context=self._ctx) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace") if exc.fp else ""
+            try:
+                parsed = json.loads(detail)
+            except ValueError:
+                parsed = None
+            if exc.code == 409 and isinstance(parsed, dict):
+                return parsed  # {"detail": {"resync": true, ...}} -> _is_resync
+            why = parsed.get("detail") if isinstance(parsed, dict) else detail
+            raise GatewayError(f"POST {url} -> HTTP {exc.code}: {str(why)[:300]}") from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise GatewayError(f"cannot reach {self.base_url}: {exc}") from exc
+        try:
+            out = json.loads(raw or b"{}")
+        except ValueError as exc:
+            raise GatewayError(f"POST {url}: response is not JSON") from exc
+        if not isinstance(out, dict):
+            raise GatewayError(f"POST {url}: unexpected {type(out).__name__}")
+        return out
+
+
+def push_files(client: Any, db: Any, node_id: str, *,
                volumes: list | None = None, roots: list[str] | None = None,
                max_bytes: int = MAX_PART_BYTES - _CHUNK_SAFETY_MARGIN,
                max_rows: int = MAX_FILE_ROWS) -> dict:
