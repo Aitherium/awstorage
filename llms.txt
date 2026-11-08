@@ -26,6 +26,8 @@ Scan one drive and read a ranked inventory of what fills it, with each tree mark
 - [awshare](https://aitherium.github.io/awshare/) — Publish an artifact and fetch it back verified.
 - [awm](https://aitherium.github.io/awm/) — A portable, scoped agent memory.
 - [awrise](https://aitherium.github.io/awrise/) — Wake an agent on a schedule, let it do one thing, and put it back to sleep.
+- [awrtifact](https://aitherium.github.io/awrtifact/) — Deliberately chunk artifacts into GitHub release assets — the productized aitherkvcache mirror lane.
+- [awrelay](https://aitherium.github.io/awrelay/) — Portable agent messaging — findings, alerts, coordination.
 
 ## Where it lives
 
