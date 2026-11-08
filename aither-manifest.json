@@ -21,15 +21,5 @@
     "awrtifact",
     "awrelay"
   ],
-  "includes": [],
-  "metrics": {
-    "files": {
-      "value": 80,
-      "as_of": "2026-11-08T07:11:35-08:00"
-    },
-    "tests": {
-      "value": 27,
-      "as_of": "2026-11-08T07:11:35-08:00"
-    }
-  }
+  "includes": []
 }
