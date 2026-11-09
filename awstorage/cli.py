@@ -631,6 +631,23 @@ def _cmd_files_tree(a) -> int:
     return 0
 
 
+def _cmd_files_forget(a) -> int:
+    node = a.node or whoami()
+    db = _files_db(a)
+    try:
+        db.execute("PRAGMA busy_timeout = 60000")
+        out = _files.forget_prefix(db, a.prefix, node=node)
+    finally:
+        db.close()
+    if a.json:
+        print(json.dumps(out, indent=1))
+    else:
+        print(f"forgot {out['files']} files ({out['bytes'] / 2**30:.1f} GiB indexed), "
+              f"{out['dirs']} dirs, {out['tombstones']} tombstones under {out['prefix']} "
+              f"on node {node}")
+    return 0
+
+
 def _cmd_files_nodes(a) -> int:
     db = _files_db(a)
     try:
@@ -818,6 +835,11 @@ def _add_files_parser(sub) -> None:
     common(t)
     _add_read_flags(t)
     t.set_defaults(fn=_cmd_files_tree)
+
+    fg = fsub.add_parser("forget", help="drop a subtree from the index, writing no tombstones")
+    fg.add_argument("prefix", help="directory whose rows to drop, e.g. D:/wt")
+    common(fg)
+    fg.set_defaults(fn=_cmd_files_forget)
 
     n = fsub.add_parser("nodes", help="what this index holds: roots, freshness, volumes")
     common(n)

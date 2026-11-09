@@ -534,3 +534,46 @@ def test_cli_files_roundtrip(tmp_path, root, capsys, monkeypatch):
     assert main(["files", "find", "re", "--index", idx, "--local"]) == 2
     assert main(["whoami", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["node"] == "n-cli"
+
+
+def test_forget_prefix_drops_a_subtree_without_tombstones(db, root, tmp_path):
+    # A sibling whose name shares the prefix ("backup" vs "backup2") must survive.
+    (root / "backup2").mkdir()
+    (root / "backup2" / "keep.txt").write_bytes(b"keep" * 10)
+    _scan(db, root, hash_mode="none")
+    (root / "docs" / "notes.txt").unlink()
+    (root / "backup" / "clip-near.bin").unlink()           # a tombstone UNDER the prefix
+    _scan(db, root, hash_mode="none")
+    root_dir = F.norm_path(root)
+    before = db.execute("SELECT bytes, files FROM dirs WHERE node='n1' AND path=?",
+                        (root_dir,)).fetchone()
+    gone = sum(len(p.read_bytes()) for p in (root / "backup").iterdir())
+    out = F.forget_prefix(db, F.norm_path(root / "backup"), node="n1", chunk=1)
+    assert out["files"] == 1 and out["bytes"] == gone and out["tombstones"] == 1
+    assert not _row(db, root / "backup" / "clip-copy.bin")
+    assert _row(db, root / "backup2" / "keep.txt") and _row(db, root / "media" / "clip.bin")
+    assert db.execute("SELECT count(*) FROM files_deleted WHERE path LIKE ?",
+                      (F.norm_path(root / "backup") + "/%",)).fetchone()[0] == 0
+    assert db.execute("SELECT count(*) FROM files_deleted").fetchone()[0] == 1  # docs kept
+    assert not db.execute("SELECT 1 FROM dirs WHERE node='n1' AND path=?",
+                          (F.norm_path(root / "backup"),)).fetchone()
+    after = db.execute("SELECT bytes, files FROM dirs WHERE node='n1' AND path=?",
+                       (root_dir,)).fetchone()
+    assert after == (before[0] - gone, before[1] - 1)      # parent totals stay honest
+    assert not F.forget_prefix(db, F.norm_path(root / "backup"), node="n1")["files"]
+
+
+def test_forget_gives_the_pages_back_to_the_filesystem(tmp_path):
+    """incremental_vacuum must be STEPPED: a bare execute() frees one page."""
+    d = F.open_index(tmp_path / "big.db")
+    r = tmp_path / "tree"
+    (r / "wt").mkdir(parents=True)
+    for i in range(1500):
+        (r / "wt" / f"f{i:04d}-{'x' * 60}.txt").write_bytes(b"x")
+    F.scan_files(d, [r], node="n1", hash_mode="none", guards=Guards())
+    d.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    before = (tmp_path / "big.db").stat().st_size
+    F.forget_prefix(d, F.norm_path(r / "wt"), node="n1")
+    assert d.execute("PRAGMA freelist_count").fetchone()[0] == 0
+    assert (tmp_path / "big.db").stat().st_size < before
+    d.close()

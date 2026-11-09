@@ -1718,7 +1718,86 @@ def maintain(db: sqlite3.Connection) -> None:
     if fts_tokenizer(db):
         with db:
             db.execute("INSERT INTO files_fts(files_fts) VALUES ('optimize')")
-    db.execute("PRAGMA incremental_vacuum")
+    # .fetchall(): the pragma frees pages only as its rows are STEPPED; a bare execute()
+    # steps once and frees ONE page (measured 2026-11-08: 1 of 2,506), so this never shrank
+    # the file.
+    db.execute("PRAGMA incremental_vacuum").fetchall()
+
+
+def _prefix_range(prefix: str) -> tuple[str, str]:
+    """[lo, hi) covering every path under ``prefix`` (a directory, with or without '/')."""
+    p = prefix.replace("\\", "/").rstrip("/") + "/"
+    return p, p[:-1] + chr(ord("/") + 1)
+
+
+def forget_prefix(db: sqlite3.Connection, prefix: str, *, node: str,
+                  tenant: str = PLATFORM_TENANT, chunk: int = TXN_ROWS,
+                  checkpoint_every: int = 20) -> dict:
+    """Drop everything the index holds under ``prefix`` WITHOUT writing tombstones.
+
+    For a tree that should never have been indexed (agent worktrees that are created and
+    retired all day): the scan's own delete path would turn every row into a tombstone,
+    growing the database before the 30-day prune shrinks it. Rows go in small
+    transactions with a WAL checkpoint between batches, so cleaning a 30 GB index never
+    needs more than a few hundred MB of free disk. Freed pages go back through
+    ``incremental_vacuum`` (no full VACUUM, which needs a second copy of the file).
+    """
+    lo, hi = _prefix_range(prefix)
+    out = {"prefix": lo, "files": 0, "bytes": 0, "dirs": 0, "tombstones": 0}
+    batches = 0
+
+    def _ckpt() -> None:
+        nonlocal batches
+        batches += 1
+        if batches % checkpoint_every == 0:
+            # vacuum THEN checkpoint: in WAL mode the truncation reaches the file at the
+            # checkpoint, so the other order leaves the file its old size.
+            db.execute("PRAGMA incremental_vacuum(20000)").fetchall()
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    while True:
+        with db:
+            got = db.execute(
+                "SELECT path, bytes, sha256 FROM files WHERE tenant = ? AND node = ?"
+                " AND path >= ? AND path < ? LIMIT ?", (tenant, node, lo, hi, chunk)).fetchall()
+            if not got:
+                break
+            deltas: dict = {}
+            for path, b, _sha in got:
+                _add_delta(deltas, path, -int(b), -1, 0)
+                out["bytes"] += int(b)
+            for part in _chunks([g[0] for g in got], _IN_CHUNK):
+                db.execute("DELETE FROM files WHERE tenant = ? AND node = ? AND path IN ("
+                           + ",".join("?" * len(part)) + ")", [tenant, node, *part])
+            # Ancestors ABOVE the prefix keep honest totals; dirs under it are dropped below.
+            _apply_dir_deltas(db, tenant, node,
+                              {d: v for d, v in deltas.items() if not lo <= d + "/" < hi})
+            _refresh_groups(db, tenant, {g[2] for g in got})
+            out["files"] += len(got)
+        _ckpt()
+    while True:
+        with db:
+            cur = db.execute(
+                "DELETE FROM dirs WHERE rowid IN (SELECT rowid FROM dirs WHERE tenant = ?"
+                " AND node = ? AND ((path >= ? AND path < ?) OR path = ?) LIMIT ?)",
+                (tenant, node, lo, hi, lo[:-1], chunk))
+        if not cur.rowcount:
+            break
+        out["dirs"] += cur.rowcount
+        _ckpt()
+    top = db.execute("SELECT max(rowid) FROM files_deleted").fetchone()[0] or 0
+    step = chunk * 40
+    for start in range(0, top + 1, step):
+        with db:
+            cur = db.execute(
+                "DELETE FROM files_deleted WHERE rowid >= ? AND rowid < ? AND tenant = ?"
+                " AND node = ? AND path >= ? AND path < ?",
+                (start, start + step, tenant, node, lo, hi))
+        out["tombstones"] += cur.rowcount
+        _ckpt()
+    db.execute("PRAGMA incremental_vacuum").fetchall()
+    db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    return out
 
 
 # ---------------------------------------------------------------------------
