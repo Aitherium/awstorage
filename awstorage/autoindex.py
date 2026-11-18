@@ -33,6 +33,23 @@ JOB_NAME = "aither-file-index"
 WIN_TASK = "AitherFileIndex"
 DEFAULT_EVERY_HOURS = 6
 DEFAULT_BUDGET_S = 5400
+#: The whole pass's wall clock (``job_timeout_s`` in the config). Every step gets its
+#: OWN subprocess timeout carved out of what is left of it, so a slow push or publish
+#: fails as that step in the receipt instead of the scheduler killing the pass blind.
+JOB_TIMEOUT_S = DEFAULT_BUDGET_S + 1800
+#: Kept free at the end of the pass for the receipt and the scheduler's own slack.
+JOB_MARGIN_S = 60
+#: The longest each later step may take; the scan gets whatever they leave.
+PUSH_TIMEOUT_S = 900
+PUBLISH_TIMEOUT_S = 600
+KIND_TIMEOUT_S = 300
+#: Headroom between the scan's --budget and its subprocess timeout (hashing tail,
+#: index commit and the JSON report run after the budget's deadline).
+SCAN_SLACK_S = 600
+#: A step with less time than this left is not started (recorded as timed out).
+MIN_STEP_S = 30
+#: The exit code recorded for a step killed by, or never started for, lack of time.
+TIMEOUT_EXIT = 124
 #: A system drive with less free space than this does not get the index.
 LOW_SYSTEM_FREE_BYTES = 30 * 1024 ** 3
 #: An alternative volume must have at least this much free to be worth moving to.
@@ -143,27 +160,37 @@ def run_pass(cfg: dict | None = None, *, run: Callable[..., Any] | None = None,
     catalog = str(index_dir / "catalog.db")
     publish = bool(cfg.get("inventory_publish"))
     receipt["publish_exit"] = None if publish else "disabled"
+    job_s = int(cfg.get("job_timeout_s") or JOB_TIMEOUT_S)
+    deadline = time.monotonic() + job_s - JOB_MARGIN_S
+    # The scan gets what the later steps' caps leave, and its --budget stops the walk
+    # early enough for the scan's own tail to finish inside its timeout.
+    later = PUSH_TIMEOUT_S + (PUBLISH_TIMEOUT_S if publish else 0)
+    budget = int(cfg.get("budget_s") or DEFAULT_BUDGET_S)
+    scan_cap = max(0.0, min(budget + SCAN_SLACK_S, deadline - time.monotonic() - later))
+    scan_budget = max(MIN_STEP_S, int(min(budget, scan_cap - SCAN_SLACK_S)))
+    receipt.update(job_timeout_s=job_s, scan_budget_s=scan_budget)
     steps = (
-        ("scan", [py, "-m", "awstorage", "files", "scan", "--all-volumes", "--hash", "auto",
-                  "--budget", str(int(cfg.get("budget_s") or DEFAULT_BUDGET_S)), "--quiet",
-                  "--catalog", catalog, "--node", node, "--json"]),
-        ("push", [py, "-m", "awstorage", "files", "push", "--catalog", catalog, "--node", node,
-                  "--json"] + (["--api", str(cfg["api"])] if cfg.get("api") else [])),
+        ("scan", scan_cap,
+         [py, "-m", "awstorage", "files", "scan", "--all-volumes", "--hash", "auto",
+          "--budget", str(scan_budget), "--quiet",
+          "--catalog", catalog, "--node", node, "--json"]),
+        ("push", PUSH_TIMEOUT_S,
+         [py, "-m", "awstorage", "files", "push", "--catalog", catalog, "--node", node,
+          "--json"] + (["--api", str(cfg["api"])] if cfg.get("api") else [])),
     ) + ((
         # The signed GitHub inventory (inventory.py): its own transport, so it runs even
         # when the Genesis push failed -- and its failure lands in this receipt too.
-        ("publish", [py, "-m", "awstorage", "inventory", "publish", "--catalog", catalog,
-                     "--node", node, "--json"]
+        ("publish", PUBLISH_TIMEOUT_S,
+         [py, "-m", "awstorage", "inventory", "publish", "--catalog", catalog,
+          "--node", node, "--json"]
          + (["--repo", str(cfg["inventory_repo"])] if cfg.get("inventory_repo") else [])),
     ) if publish else ())
-    for name, argv in steps:
+    for name, cap, argv in steps:
         out_f, err_f = index_dir / f"{name}.json", index_dir / f"{name}.err"
-        try:
-            with open(out_f, "wb") as so, open(err_f, "wb") as se:
-                rc = int(run(argv, stdout=so, stderr=se, env=env).returncode)
-        except OSError as exc:
-            rc = 2
-            receipt["error"] = f"{name} did not start: {exc}"
+        timeout = min(float(cap), deadline - time.monotonic())
+        rc, why = _run_step(run, argv, out_f, err_f, env, timeout)
+        if why and not receipt["error"]:
+            receipt["error"] = f"{name} {why}"
         receipt[f"{name}_exit"] = rc
         if rc != 0 and receipt["failed_step"] is None:
             receipt["failed_step"] = name
@@ -178,10 +205,30 @@ def run_pass(cfg: dict | None = None, *, run: Callable[..., Any] | None = None,
             except (OSError, ValueError) as exc:
                 receipt["published"] = {"unreadable": f"{out_f}: {exc}"[:200]}
     if publish and cfg.get("inventory_kinds", True):
-        receipt["kinds"] = _publish_kinds(cfg, index_dir, catalog, node, py, run, env)
+        receipt["kinds"] = _publish_kinds(cfg, index_dir, catalog, node, py, run, env,
+                                          deadline=deadline)
     if receipt["failed_step"] is None:
         receipt["exit_code"] = 0
     return _finish(receipt, index_dir)
+
+
+def _run_step(run: Callable[..., Any], argv: list[str], out_f: Path, err_f: Path,
+              env: dict, timeout: float) -> tuple[int, str]:
+    """Run one step with its stdio in files and its OWN timeout.
+
+    Returns (exit code, why) -- `why` is empty unless the step never ran or was killed:
+    a step with under MIN_STEP_S left is not started and one that outlives `timeout`
+    is killed; both exit TIMEOUT_EXIT, so the receipt names the step that ran out."""
+    if timeout < MIN_STEP_S:
+        return TIMEOUT_EXIT, f"not started: {max(0, int(timeout))}s left of the pass"
+    try:
+        with open(out_f, "wb") as so, open(err_f, "wb") as se:
+            rc = int(run(argv, stdout=so, stderr=se, env=env, timeout=timeout).returncode)
+    except subprocess.TimeoutExpired:
+        return TIMEOUT_EXIT, f"timed out after {int(timeout)}s (its own step timeout)"
+    except OSError as exc:
+        return 2, f"did not start: {exc}"
+    return rc, ""
 
 
 def kinds_every_s() -> int:
@@ -208,9 +255,12 @@ def kinds_due(index_dir: Path, now: float | None = None) -> list[str]:
 
 
 def _publish_kinds(cfg: dict, index_dir: Path, catalog: str, node: str, py: str,
-                   run: Callable[..., Any], env: dict) -> dict:
+                   run: Callable[..., Any], env: dict, *,
+                   deadline: float | None = None) -> dict:
     """hardware / software / services, each when due. Never fails the files pass: each
-    outcome is in the receipt and only a success moves that kind's timestamp."""
+    outcome is in the receipt and only a success moves that kind's timestamp. Each
+    publish is capped at KIND_TIMEOUT_S and at what is left before `deadline`."""
+    deadline = time.monotonic() + JOB_TIMEOUT_S if deadline is None else deadline
     out: dict = {}
     due = kinds_due(index_dir)
     try:
@@ -226,11 +276,10 @@ def _publish_kinds(cfg: dict, index_dir: Path, catalog: str, node: str, py: str,
                  catalog, "--node", node, "--json"]
                 + (["--repo", str(cfg["inventory_repo"])] if cfg.get("inventory_repo") else []))
         out_f, err_f = index_dir / f"publish-{k}.json", index_dir / f"publish-{k}.err"
-        try:
-            with open(out_f, "wb") as so, open(err_f, "wb") as se:
-                rc = int(run(argv, stdout=so, stderr=se, env=env).returncode)
-        except OSError as exc:
-            out[k] = {"exit": 2, "error": f"did not start: {exc}"[:300]}
+        rc, why = _run_step(run, argv, out_f, err_f, env,
+                            min(float(KIND_TIMEOUT_S), deadline - time.monotonic()))
+        if why:
+            out[k] = {"exit": rc, "error": why[:300]}
             continue
         if rc != 0:
             out[k] = {"exit": rc, "error": _tail(err_f) or _tail(out_f) or f"exit {rc}"}
@@ -294,12 +343,20 @@ def _err(r: Any) -> str:
     return (str(getattr(r, "stderr", "") or getattr(r, "stdout", "") or "")).strip()[:300]
 
 
-def _install_awrise(run, argv: list[str], every_hours: int) -> dict:
+def _install_awrise(run, argv: list[str], every_hours: int,
+                    index_dir: Path | None = None) -> dict:
+    """A DETACHED wake judged by the pass's own receipt: a pass outlives awrise's 60 s
+    tick by hours, and an attached one that is killed records only "no output
+    captured". The awrise timeout sits past the pass's own (JOB_TIMEOUT_S), so the
+    per-step timeouts fire first and the receipt names the step that ran out."""
+    receipt = (index_dir or default_index_dir()) / "last_run.json"
     run(["awrise", "remove", "--name", JOB_NAME], capture_output=True, text=True)
     r = run(["awrise", "add", "--name", JOB_NAME, "--every", f"{every_hours}h",
-             "--run", _quote(argv), "--timeout", str(DEFAULT_BUDGET_S + 1800)],
+             "--run", _quote(argv), "--timeout", str(JOB_TIMEOUT_S + 600), "--detach",
+             "--receipt", str(receipt)],
             capture_output=True, text=True)
-    return {"scheduler": "awrise", "ok": _ok(r), "detail": "" if _ok(r) else _err(r)}
+    return {"scheduler": "awrise", "ok": _ok(r), "detail": "" if _ok(r) else _err(r),
+            "receipt": str(receipt)}
 
 
 def _install_windows(run, argv: list[str], every_hours: int) -> dict:
@@ -429,7 +486,7 @@ def schedule(*, every_hours: int = DEFAULT_EVERY_HOURS, index_dir: str | None = 
     argv = sync_argv(python)
     try:
         if which("awrise"):
-            res = _install_awrise(run, argv, every_hours)
+            res = _install_awrise(run, argv, every_hours, idx)
         elif plat == "windows":
             res = _install_windows(run, argv, every_hours)
         elif plat == "macos":

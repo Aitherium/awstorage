@@ -278,7 +278,7 @@ def test_large_artifact_is_chunked_and_reassembled(env):
 # ---------------------------------------------------------------- files sync receipt
 
 def _runner(codes: dict, calls: list):
-    def run(argv, stdout=None, stderr=None, env=None):
+    def run(argv, stdout=None, stderr=None, env=None, timeout=None):
         step = argv[4]
         calls.append(step)
         rc = codes.get(step, 0)

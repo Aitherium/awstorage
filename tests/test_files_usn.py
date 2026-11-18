@@ -382,6 +382,77 @@ def test_truncated_usn_pass_keeps_the_cursor(tmp_path, root, vol):
     db.close()
 
 
+class _TickClock:
+    """`time` for files.py whose monotonic() advances one second per call: a budget of
+    N seconds lists a handful of directories, the same handful on every run."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def monotonic(self) -> float:
+        self.t += 1.0
+        return self.t
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def test_walk_too_big_for_one_budget_resumes_and_converges(tmp_path, root, vol,
+                                                           monkeypatch):
+    """Issue #17690: a root bigger than the scan budget was walked from the top every
+    pass, because a truncated walk saved no cursor. Now the cursor is saved WITH the
+    unvisited directories; each pass replays the journal and walks on, and the end
+    state equals one full walk -- including rows that went stale BEFORE the walk
+    (pruned per directory, since no single pass sees the whole root)."""
+    db = _db(tmp_path, "files.db")
+    _scan(db, root)
+    rootn = fx.norm_root(root)
+    # The state the issue found: rows from older walks, no cursor, and changes the
+    # journal will never report.
+    with db:
+        fx._usn_save(db, "platform", "n1", rootn, None)
+    (root / "media" / "clip.bin").unlink()
+    shutil.rmtree(root / "backup" / "deep")
+    (root / "fresh" / "sub").mkdir(parents=True)
+    (root / "fresh" / "sub" / "f.txt").write_bytes(b"f" * 12)
+
+    passes, journaled = 0, False
+    while True:
+        with monkeypatch.context() as m:
+            m.setattr(fx, "time", _TickClock())
+            st = fx.scan_files(db, [root], node="n1", hash_mode="none", time_budget_s=8)
+        passes += 1
+        cur = fx._usn_load(db, "platform", "n1", rootn)
+        if not st["truncated"]:
+            assert cur is not None and not cur.get("resume"), cur
+            break
+        assert cur is not None and cur.get("resume"), "a truncated walk keeps a cursor"
+        assert st["roots"][0]["resume_dirs"] == len(cur["resume"])
+        if passes == 1:
+            assert st["usn_fallback_reason"] == "no_cursor"
+        else:
+            assert st["mode"] == "usn" and st["roots"][0]["resumed"], st
+        if not journaled:
+            # A change BETWEEN passes, wherever it lands, reaches the index: the
+            # journal replays it if that part was walked, the walk sees it if not.
+            notes = root / "docs" / "notes.txt"
+            notes.write_bytes(b"edited between passes " * 50)
+            _bump_mtime(notes)
+            Journal(vol).log(notes, un.REASON_DATA_OVERWRITE | un.REASON_CLOSE)
+            journaled = True
+        assert passes < 40, "the resumed walk made no progress"
+    assert passes > 1, "the budget was meant to truncate the first pass"
+    assert (_rows(db), _dirs(db)) == _fresh_walk(tmp_path, root, monkeypatch)
+    db.close()
+
+
+def test_malformed_resume_frontier_is_ignored():
+    assert fx._load_frontier({"resume": "C:/"}) == []
+    assert fx._load_frontier({"resume": [["C:/a", None], ["C:/b"], [3, None],
+                                         ["C:/c", "C:/c"]]}) == [["C:/a", None],
+                                                                 ["C:/c", "C:/c"]]
+
+
 def test_not_windows_reports_walk(tmp_path, root, monkeypatch):
     monkeypatch.setattr(fx._usn, "supported", lambda: False)
     db = _db(tmp_path, "files.db")

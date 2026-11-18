@@ -22,6 +22,9 @@ deletes nothing. A delta push sends ``seq > since_seq``. On Windows NTFS a repea
 of a root reads the USN change journal from the cursor the last full walk left in
 ``meta`` and re-reads only the directories it names (`awstorage.usn`); every reason
 it cannot be trusted is a full walk, reported as ``mode`` / ``usn_fallback_reason``.
+A walk that runs out of budget there saves the cursor WITH the directories it did not
+reach (``resume``), pruning per directory as it goes; the next pass replays the
+journal and continues the walk, so a root bigger than one budget still converges.
 
 **Duplicates, cheaply.** Ported from the dedup engine (credited in the commit; source
 was an uncommitted ``lib/storage/dedup.py``): size bucket -> head+tail partial hash ->
@@ -611,14 +614,28 @@ def apply_changes(db: sqlite3.Connection, tenant: str, node: str, *,
 WalkItem = tuple  # (path, bytes, mtime_ns, dev, ino, nlink, git_root)
 
 
+#: One directory still to visit: [path, git_root]. A truncated walk's leftover stack
+#: of these is the RESUME frontier saved with the USN cursor (JSON lists, not tuples).
+Frontier = list
+
+
 def _walk(root: str, exclude: set[str], deadline: float,
           skip_dir: Callable[[str], bool] | None = None,
-          git_root: str | None = None) -> Iterator[WalkItem | None]:
+          git_root: str | None = None, stack: Frontier | None = None,
+          listed: Callable[[str, set[str], set[str]], None] | None = None
+          ) -> Iterator[WalkItem | None]:
     """Yield (path, bytes, mtime_ns, dev, ino, nlink, git_root) per regular file; None
     once per unreadable entry. Symlinks and reparse points (junctions) are never
     followed nor indexed. Raises TimeoutError at the deadline. `git_root` seeds the
-    repository a SUBTREE walk starts inside (the USN path re-walks subtrees)."""
-    stack: list[tuple[str, str | None]] = [(root, git_root)]
+    repository a SUBTREE walk starts inside (the USN path re-walks subtrees).
+
+    `stack`, when given, is the walk's OWN to-visit list (mutated in place): seed it
+    with a saved frontier to resume, and after a TimeoutError it holds exactly the
+    directories not yet listed -- the deadline is checked only between directories,
+    so every listed directory's files have been yielded. `listed(dir, files, subdirs)`
+    is called once per listed directory with the normalised paths the walk kept."""
+    if stack is None:
+        stack = [[root, git_root]]
     while stack:
         if time.monotonic() >= deadline:
             raise TimeoutError
@@ -631,6 +648,8 @@ def _walk(root: str, exclude: set[str], deadline: float,
             continue
         if any(e.name == ".git" for e in entries):
             git_root = norm_path(d)
+        kept_files: set[str] = set()
+        kept_dirs: set[str] = set()
         for e in entries:
             try:
                 if e.name.lower() in exclude:
@@ -641,13 +660,18 @@ def _walk(root: str, exclude: set[str], deadline: float,
                 if stat_mod.S_ISDIR(st.st_mode):
                     if skip_dir is not None and skip_dir(norm_path(e.path)):
                         continue
-                    stack.append((e.path, git_root))
+                    stack.append([e.path, git_root])
+                    kept_dirs.add(norm_path(e.path))
                 elif stat_mod.S_ISREG(st.st_mode):
                     # Windows DirEntry.stat() leaves dev/ino/nlink 0: filled at hash time.
-                    yield (norm_path(e.path), int(st.st_size), int(st.st_mtime_ns),
+                    p = norm_path(e.path)
+                    kept_files.add(p)
+                    yield (p, int(st.st_size), int(st.st_mtime_ns),
                            _nz(st.st_dev), _nz(st.st_ino), _nz(st.st_nlink), git_root)
             except OSError:
                 yield None
+        if listed is not None:
+            listed(norm_path(d), kept_files, kept_dirs)
 
 
 def _new_stats(node: str, tenant: str) -> dict:
@@ -688,16 +712,26 @@ def _walk_into(db: sqlite3.Connection, base: str, *, tenant: str, node: str,
                exclude: set[str], deadline: float, g: _guards.Guards,
                skip_dir: Callable[[str], bool] | None, scanned_at: str, st: dict,
                git_root: str | None = None,
-               progress: Callable[[dict], None] | None = None
+               progress: Callable[[dict], None] | None = None,
+               stack: Frontier | None = None, per_dir_prune: bool = False,
+               prune_base: bool = True
                ) -> tuple[int, int, int, bool, int]:
     """Walk `base` into the index; after a COMPLETED walk, rows under it that were not
-    seen become tombstones. Returns (files, bytes, errors, truncated, removed)."""
+    seen become tombstones. Returns (files, bytes, errors, truncated, removed).
+
+    A RESUMABLE walk (`stack` = the frontier, see `_walk`) cannot rely on that final
+    prune -- it spans passes, and the rows earlier passes saw are not in this pass's
+    `seen` -- so it sets `per_dir_prune`: each listed directory is diffed against the
+    rows whose parent it is (files gone from it are tombstoned, subdirectories gone from
+    it are pruned whole), which is what the final prune would have removed there; and
+    `prune_base=False` when the walk does not start at `base` itself."""
     db.execute("CREATE TEMP TABLE IF NOT EXISTS seen(path TEXT PRIMARY KEY)")
     db.execute("DELETE FROM temp.seen")
     batch: list[dict] = []
     files = total = errors = 0
     truncated = False
     last_tick = time.monotonic()
+    pruned = [0]
 
     def flush() -> None:
         with db:
@@ -707,8 +741,21 @@ def _walk_into(db: sqlite3.Connection, base: str, *, tenant: str, node: str,
         for k in ("new", "changed", "unchanged"):
             st[k] += res[k]
 
+    def listed(d: str, kept_files: set[str], kept_dirs: set[str]) -> None:
+        gone = [r[0] for r in db.execute(
+            "SELECT path FROM files WHERE tenant = ? AND node = ? AND parent = ?",
+            (tenant, node, d)) if r[0] not in kept_files]
+        if gone:
+            pruned[0] += apply_changes(db, tenant, node, deletes=gone)["deleted"]
+        for sub in [r[0] for r in db.execute(
+                "SELECT path FROM dirs WHERE tenant = ? AND node = ? AND parent = ?",
+                (tenant, node, d)) if r[0] not in kept_dirs]:
+            # Nothing under a vanished subdirectory is in temp.seen: all of it goes.
+            pruned[0] += _prune_unseen(db, tenant, node, sub)
+
     try:
-        for item in _walk(base, exclude, deadline, skip_dir=skip_dir, git_root=git_root):
+        for item in _walk(base, exclude, deadline, skip_dir=skip_dir, git_root=git_root,
+                          stack=stack, listed=listed if per_dir_prune else None):
             if item is None:
                 errors += 1
                 continue
@@ -725,7 +772,9 @@ def _walk_into(db: sqlite3.Connection, base: str, *, tenant: str, node: str,
         truncated = True
     if batch:
         flush()
-    removed = 0 if truncated else _prune_unseen(db, tenant, node, base)
+    removed = pruned[0]
+    if not truncated and prune_base:
+        removed += _prune_unseen(db, tenant, node, base)
     with db:
         db.execute("DELETE FROM temp.seen")
     return files, total, errors, truncated, removed
@@ -782,18 +831,30 @@ def index_root(db: sqlite3.Connection, root: str | os.PathLike, *, node: str,
         except Exception as e:  # noqa: BLE001 -- ANY failure of the fast path is a walk
             reason = f"error: {type(e).__name__}: {e}"[:300]
         logger.warning("files scan %s: USN journal not used (%s) -- full walk", rootn, reason)
+    # With a journal cursor to save, the walk is RESUMABLE: it prunes per directory
+    # and its leftover stack is saved, so a root too big for one budget finishes over
+    # several passes instead of restarting from the top every time.
+    resumable = windows and start is not None
+    frontier: Frontier = [[rootn, None]]
     files, total, errors, truncated, removed = _walk_into(
         db, rootn, tenant=tenant, node=node, exclude=exclude, deadline=deadline, g=g,
-        skip_dir=skip_dir, scanned_at=scanned_at, st=st, progress=progress)
+        skip_dir=skip_dir, scanned_at=scanned_at, st=st, progress=progress,
+        stack=frontier if resumable else None, per_dir_prune=resumable)
     with db:
         _upsert_root(db, tenant, node, rootn, files, total, scanned_at, truncated, errors)
         if windows:
             # The cursor was read BEFORE the walk, so whatever changed during it is
-            # replayed next time; a truncated walk leaves no cursor (the index is partial).
-            _usn_save(db, tenant, node, rootn, None if truncated else start)
+            # replayed next time. A truncated walk saves it too, with the directories
+            # it did not reach: the next pass replays the journal over what WAS walked
+            # and resumes the walk from there.
+            cursor = start
+            if truncated and start is not None:
+                cursor = dict(start, resume=frontier) if frontier else None
+            _usn_save(db, tenant, node, rootn, cursor)
     st["roots"].append({"root": rootn, "files": files, "bytes": total, "errors": errors,
                         "truncated": truncated, "scanned_at": scanned_at, "mode": "walk",
-                        "usn_fallback_reason": reason})
+                        "usn_fallback_reason": reason,
+                        "resume_dirs": len(frontier) if resumable and truncated else 0})
     st["files_seen"] += files
     st["removed"] += removed
     st["errors"] += errors
@@ -869,6 +930,32 @@ def _usn_save(db: sqlite3.Connection, tenant: str, node: str, root: str,
     else:
         db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)",
                    (key, json.dumps(cursor, sort_keys=True)))
+
+
+def _load_frontier(cur: dict) -> Frontier:
+    """The saved resume frontier of a cursor ([] when none or malformed)."""
+    raw = cur.get("resume")
+    if not isinstance(raw, list):
+        return []
+    return [[str(x[0]), x[1] if isinstance(x[1], str) else None] for x in raw
+            if isinstance(x, (list, tuple)) and len(x) == 2 and isinstance(x[0], str)]
+
+
+def _outside_frontier(relist: dict[str, int], walk: set[str], frontier: Frontier
+                      ) -> tuple[dict[str, int], set[str]]:
+    """Drop journal work at or below a directory the resumed walk has yet to visit."""
+    tops = {_clean(d) for d, _g in frontier}
+
+    def pending(p: str) -> bool:
+        q: str | None = p
+        while q:
+            if q in tops:
+                return True
+            q = parent_of(q)
+        return False
+
+    return ({p: r for p, r in relist.items() if not pending(p)},
+            {w for w in walk if not pending(w)})
 
 
 def _usn_summary(st: dict) -> None:
@@ -969,11 +1056,26 @@ def _usn_index(db: sqlite3.Connection, rootn: str, *, tenant: str, node: str,
                                                          j.journal_id)
         except _usn.UsnError as e:
             raise _UsnFallbackError(e.reason, start) from e
+        frontier = _load_frontier(cur)
+        if frontier:
+            # The not-yet-walked part is walked below anyway: replaying it here would
+            # pull whole unseen subtrees in through `relist_one` first.
+            relist, walk = _outside_frontier(relist, walk, frontier)
         res = _usn_apply(db, rootn, relist, walk, tenant=tenant, node=node, exclude=exclude,
                          g=g, skip_dir=skip_dir, deadline=deadline, scanned_at=scanned_at,
                          st=st)
     finally:
         vol.close()
+    resumed = bool(frontier) and not res["truncated"]
+    if resumed:
+        rfiles, _b, rerrors, rtrunc, rremoved = _walk_into(
+            db, rootn, tenant=tenant, node=node, exclude=exclude, deadline=deadline, g=g,
+            skip_dir=skip_dir, scanned_at=scanned_at, st=st, stack=frontier,
+            per_dir_prune=True, prune_base=False)
+        res["files"] += rfiles
+        res["errors"] += rerrors
+        res["removed"] += rremoved
+        res["truncated"] = rtrunc
     truncated = res["truncated"]
     row = db.execute("SELECT files, bytes FROM dirs WHERE tenant = ? AND node = ? AND path = ?",
                      (tenant, node, rootn)).fetchone()
@@ -983,6 +1085,11 @@ def _usn_index(db: sqlite3.Connection, rootn: str, *, tenant: str, node: str,
                      res["errors"])
         if not truncated:   # a truncated pass keeps the old cursor and replays next time
             _usn_save(db, tenant, node, rootn, dict(start, walk_next=bool(unresolved)))
+        elif resumed and frontier:
+            # The journal was replayed in full and the resumed walk got further: the
+            # NEW cursor covers what is now walked, the leftover frontier the rest.
+            _usn_save(db, tenant, node, rootn,
+                      dict(start, walk_next=bool(unresolved), resume=frontier))
     if unresolved:
         logger.warning("files scan %s: %d USN records could not be resolved -- the next"
                        " scan walks the root in full", rootn, unresolved)
@@ -991,7 +1098,9 @@ def _usn_index(db: sqlite3.Connection, rootn: str, *, tenant: str, node: str,
                         "scanned_at": scanned_at, "mode": "usn", "usn_fallback_reason": None,
                         "usn_records": len(records), "usn_dirs_relisted": res["relisted"],
                         "usn_subtrees_walked": res["walked"], "usn_denied": denied,
-                        "usn_unresolved": unresolved, "usn_walk_next": bool(unresolved)})
+                        "usn_unresolved": unresolved, "usn_walk_next": bool(unresolved),
+                        "resumed": resumed,
+                        "resume_dirs": len(frontier) if resumed and truncated else 0})
     st["files_seen"] += res["files"]
     st["removed"] += res["removed"]
     st["errors"] += res["errors"]

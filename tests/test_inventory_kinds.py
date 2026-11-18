@@ -391,7 +391,7 @@ def test_software_and_services_publish_carry_no_secrets(env):
 # ---------------------------------------------------------------- files sync cadence
 
 def _runner(calls: list, fail: set | None = None):
-    def run(argv, stdout=None, stderr=None, env=None):
+    def run(argv, stdout=None, stderr=None, env=None, timeout=None):
         step = argv[4] + (f":{argv[argv.index('--kind') + 1]}" if "--kind" in argv else "")
         calls.append(step)
         rc = 1 if fail and step in fail else 0

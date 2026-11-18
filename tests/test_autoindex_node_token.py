@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import types
 import urllib.error
 from pathlib import Path
@@ -127,7 +128,7 @@ def test_cli_push_uses_the_device_credential_and_refuses_a_foreign_node(tmp_path
 # ---------------------------------------------------------------- files sync receipt
 
 def _runner(codes: dict, calls: list):
-    def run(argv, stdout=None, stderr=None, env=None):
+    def run(argv, stdout=None, stderr=None, env=None, timeout=None):
         step = argv[4]  # python -m awstorage files <step>
         calls.append((step, env.get("AWSTORAGE_NODE"), env.get("SQLITE_TMPDIR")))
         rc = codes.get(step, 0)
@@ -225,6 +226,60 @@ def test_schedule_scheduler_failure_is_returned_not_swallowed(enrolled_home):
                              which=lambda _n: None, platform="windows", python="py",
                              cfg_path=enrolled_home / "cfg.json")
     assert out["ok"] is False and "Access is denied" in out["detail"]
+
+
+def test_awrise_wake_is_detached_and_judged_by_the_receipt(enrolled_home):
+    calls: list = []
+    autoindex.schedule(index_dir=str(enrolled_home / "i"), run=_ok_run(calls),
+                       which=lambda n: "/x/awrise" if n == "awrise" else None,
+                       platform="linux", python="py", cfg_path=enrolled_home / "cfg.json")
+    add = next(c for c in calls if c[:2] == ["awrise", "add"])
+    assert "--detach" in add
+    assert add[add.index("--receipt") + 1] == str(enrolled_home / "i" / "last_run.json")
+    # The scheduler's kill sits past the pass's own clock: the step timeouts fire first.
+    assert int(add[add.index("--timeout") + 1]) > autoindex.JOB_TIMEOUT_S
+
+
+def test_every_step_gets_its_own_timeout_inside_the_job_clock(tmp_path):
+    seen: dict = {}
+
+    def run(argv, stdout=None, stderr=None, env=None, timeout=None):
+        seen[argv[4]] = (timeout, argv)
+        return types.SimpleNamespace(returncode=0)
+
+    rec = autoindex.run_pass({"index_dir": str(tmp_path / "idx"), "node": "box-7",
+                              "inventory_publish": True, "inventory_kinds": False},
+                             run=run, python="py")
+    assert rec["exit_code"] == 0
+    total = sum(t for t, _a in seen.values())
+    assert all(t is not None and t > 0 for t, _a in seen.values())
+    assert total <= autoindex.JOB_TIMEOUT_S - autoindex.JOB_MARGIN_S + 1
+    scan_t, scan_argv = seen["scan"]
+    budget = int(scan_argv[scan_argv.index("--budget") + 1])
+    assert budget == rec["scan_budget_s"] and budget + autoindex.SCAN_SLACK_S <= scan_t + 1
+
+
+def test_a_hung_push_is_killed_as_that_step_and_the_receipt_says_so(tmp_path):
+    def run(argv, stdout=None, stderr=None, env=None, timeout=None):
+        if argv[4] == "push":
+            raise subprocess.TimeoutExpired(argv, timeout)
+        return types.SimpleNamespace(returncode=0)
+
+    rec = autoindex.run_pass({"index_dir": str(tmp_path / "idx"), "node": "box-7",
+                              "inventory_publish": False}, run=run, python="py")
+    assert rec["failed_step"] == "push" and rec["push_exit"] == autoindex.TIMEOUT_EXIT
+    assert "timed out" in rec["error"] and rec["exit_code"] == autoindex.TIMEOUT_EXIT
+    on_disk = json.loads((tmp_path / "idx" / "last_run.json").read_text(encoding="utf-8"))
+    assert on_disk["failed_step"] == "push"
+
+
+def test_a_step_with_no_time_left_is_not_started(tmp_path):
+    calls: list = []
+    rec = autoindex.run_pass({"index_dir": str(tmp_path / "idx"), "node": "box-7",
+                              "inventory_publish": False, "job_timeout_s": 61},
+                             run=_runner({}, calls), python="py")
+    assert calls == [] and rec["failed_step"] == "scan"
+    assert rec["scan_exit"] == autoindex.TIMEOUT_EXIT and "not started" in rec["error"]
 
 
 def test_systemd_and_launchd_units_run_sync():
