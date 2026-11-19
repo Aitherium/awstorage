@@ -281,6 +281,103 @@ def test_whole_subtree_deleted_frns_proven_by_delete_records(tmp_path, root, vol
     db.close()
 
 
+# -- the replay is bounded by the pass budget (#17909) ------------------------------------
+
+class _Clock:
+    """`fx.time` with a hand-driven monotonic clock; every other attribute is real."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def __getattr__(self, name: str):
+        return getattr(time, name)
+
+
+class SlowVolume(FakeVolume):
+    """Each journal record read costs `read_cost` and each FRN resolved `resolve_cost`
+    seconds of the fake clock."""
+
+    def __init__(self, top: Path, state: dict, clock: _Clock) -> None:
+        super().__init__(top, state)
+        self.clock = clock
+
+    def read_until(self, start, end, journal_id):
+        for r in super().read_until(start, end, journal_id):
+            self.clock.t += self.state.get("read_cost", 0.0)
+            yield r
+
+    def resolve(self, frn):
+        self.clock.t += self.state.get("resolve_cost", 0.0)
+        return super().resolve(frn)
+
+
+@pytest.fixture()
+def slow(monkeypatch, tmp_path, vol):
+    clock = _Clock()
+    monkeypatch.setattr(fx, "time", clock)
+    monkeypatch.setattr(fx, "_usn_volume", lambda root: SlowVolume(tmp_path, vol, clock))
+    return vol
+
+
+def _cursor(db, root: Path) -> dict | None:
+    return fx._usn_load(db, "platform", "n1", fx.norm_root(root))
+
+
+def test_journal_replay_stops_at_the_deadline_and_saves_its_progress(tmp_path, root, slow,
+                                                                     monkeypatch):
+    db = _db(tmp_path, "files.db")
+    _scan(db, root)
+    j = Journal(slow)
+    made = []
+    for i, d in enumerate(("docs", "media", "keep", "proj/src", "backup")):
+        p = root / d / f"new{i}.txt"
+        p.write_bytes(b"x" * (10 + i))
+        j.log(p, un.REASON_FILE_CREATE | un.REASON_CLOSE)
+        made.append(p)
+    usns = [r.usn for r in slow["records"]]
+    # budget 100 s, read share 25 s, 10 s per record read: two records fit per pass.
+    slow["read_cost"] = 10.0
+    passes = []
+    for _ in range(4):
+        st = fx.scan_files(db, [root], node="n1", hash_mode="none", time_budget_s=100.0)
+        assert st["mode"] == "usn", st
+        passes.append((st["roots"][0]["usn_records"], st["truncated"],
+                       _cursor(db, root)["next_usn"]))
+        if not st["truncated"]:
+            break
+    # Each truncated pass saved the usn it got to: the window shrank, never replayed.
+    assert passes == [(2, True, usns[2]), (2, True, usns[4]), (1, False, slow["next_usn"])]
+    assert (_rows(db), _dirs(db)) == _fresh_walk(tmp_path, root, monkeypatch)
+    assert {fx.norm_path(p) for p in made} <= {r[0] for r in _rows(db)}
+    db.close()
+
+
+def test_resolving_past_the_plan_deadline_cuts_the_chunk(tmp_path, root, slow, monkeypatch):
+    db = _db(tmp_path, "files.db")
+    _scan(db, root)
+    j = Journal(slow)
+    for d in ("docs", "media", "keep"):
+        p = root / d / "late.txt"
+        p.write_bytes(b"late")
+        j.log(p, un.REASON_FILE_CREATE | un.REASON_CLOSE)
+    usns = [r.usn for r in slow["records"]]
+    # plan share 50 s of 100, 30 s per FRN: the third record is past it.
+    slow["resolve_cost"] = 30.0
+    st = fx.scan_files(db, [root], node="n1", hash_mode="none", time_budget_s=100.0)
+    r0 = st["roots"][0]
+    assert st["mode"] == "usn" and st["truncated"] and r0["usn_partial"], st
+    assert (r0["usn_records"], st["new"]) == (2, 2)
+    assert _cursor(db, root)["next_usn"] == usns[2]
+    st = fx.scan_files(db, [root], node="n1", hash_mode="none", time_budget_s=100.0)
+    assert st["mode"] == "usn" and not st["truncated"] and st["new"] == 1, st
+    assert _cursor(db, root)["next_usn"] == slow["next_usn"]
+    assert (_rows(db), _dirs(db)) == _fresh_walk(tmp_path, root, monkeypatch)
+    db.close()
+
+
 # -- every fallback is a walk, with the reason in the JSON --------------------------------
 
 def _walk_then(tmp_path, root, vol, **change) -> dict:

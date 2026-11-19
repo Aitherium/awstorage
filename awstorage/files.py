@@ -891,6 +891,12 @@ _DIR_REWALK = (_usn.REASON_FILE_CREATE | _usn.REASON_RENAME_NEW_NAME
                | _usn.REASON_REPARSE_POINT_CHANGE | _SECURITY_CHANGE)
 _CREATED = _usn.REASON_FILE_CREATE | _usn.REASON_RENAME_NEW_NAME
 _usn_volume: Callable[[str], Any] = _usn.Volume   # tests inject a fake volume here
+# Shares of the pass budget the journal replay may spend BEFORE applying anything:
+# reading stops at the first, resolving FRNs must finish by the second, and the rest is
+# left for re-listing. Without them a long window read and resolved past the step
+# timeout and the pass died with nothing saved (#17909).
+_USN_READ_SHARE = 0.25
+_USN_PLAN_SHARE = 0.5
 
 
 class _UsnFallbackError(Exception):
@@ -981,10 +987,52 @@ def _root_canonical(rootn: str) -> bool:
     return (real.lower() == rootn.lower()) if sys.platform == "win32" else real == rootn
 
 
-def _usn_plan(vol: Any, records: list, rootn: str, end_usn: int, journal_id: int
-              ) -> tuple[dict[str, int], set[str], int, int]:
+def _usn_read(vol: Any, start_usn: int, end_usn: int, journal_id: int, read_by: float
+              ) -> tuple[list, int]:
+    """Journal records from `start_usn` toward `end_usn` until `read_by`: (records, the
+    usn they cover up to -- `end_usn` when the window was read in full, else the usn of
+    the first record left unread). At least one record is always taken, so every pass
+    shrinks the replay window."""
+    records: list = []
+    it = vol.read_until(start_usn, end_usn, journal_id)
+    try:
+        for r in it:
+            if records and time.monotonic() >= read_by:
+                return records, int(r.usn)
+            records.append(r)
+    finally:
+        close = getattr(it, "close", None)
+        if close is not None:
+            close()
+    return records, end_usn
+
+
+def _usn_plan(vol: Any, records: list, rootn: str, end_usn: int, journal_id: int,
+              deadline: float | None = None
+              ) -> tuple[dict[str, int], set[str], int, int, int, int]:
     """records -> ({dir to re-list: reasons seen in it}, subtrees to walk, denied,
-    unresolved)."""
+    unresolved, records planned, the usn they cover up to).
+
+    FRNs are resolved record by record, in usn order. At `deadline` the chunk is cut
+    before the first record not yet resolved (at least one is always planned), so the
+    caller applies -- and saves a cursor for -- a prefix of the window instead of
+    running past the pass budget. A read-on to now cut by the deadline counts its
+    unproven FRNs as unresolved: the next pass walks, it never trusts an unproven gap."""
+
+    def late() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
+
+    resolved: dict[int, tuple[str | None, int]] = {}
+    planned = len(records)
+    for i, r in enumerate(records):
+        if i and late():
+            planned, end_usn = i, int(r.usn)
+            break
+        for frn in ((r.parent_frn, r.frn) if r.is_dir and r.reason & _DIR_REWALK
+                    else (r.parent_frn,)):
+            if frn not in resolved:
+                resolved[frn] = vol.resolve(frn)
+    records = records[:planned]
     deleted = {r.frn for r in records if r.reason & _usn.REASON_FILE_DELETE}
     parents: dict[int, int] = {}
     for r in records:
@@ -995,7 +1043,7 @@ def _usn_plan(vol: Any, records: list, rootn: str, end_usn: int, journal_id: int
     missing: list[int] = []
     denied = unresolved = 0
     for frn in set(parents) | moved:
-        path, err = vol.resolve(frn)
+        path, err = resolved[frn]
         if path is None:
             if err in _NOT_FOUND:
                 missing.append(frn)
@@ -1014,10 +1062,16 @@ def _usn_plan(vol: Any, records: list, rootn: str, end_usn: int, journal_id: int
     unproven = [f for f in missing if f not in deleted]
     if unproven:
         # Gone but not deleted inside the window: deleted after it? Read on to now.
-        later = {r.frn for r in vol.read_until(end_usn, vol.query().next_usn, journal_id)
-                 if r.reason & _usn.REASON_FILE_DELETE}
-        unresolved += sum(1 for f in unproven if f not in later)
-    return relist, walk, denied, unresolved
+        later: set[int] = set()
+        cut = False
+        for r in vol.read_until(end_usn, vol.query().next_usn, journal_id):
+            if late():
+                cut = True
+                break
+            if r.reason & _usn.REASON_FILE_DELETE:
+                later.add(r.frn)
+        unresolved += len(unproven) if cut else sum(1 for f in unproven if f not in later)
+    return relist, walk, denied, unresolved, planned, end_usn
 
 
 def _usn_index(db: sqlite3.Connection, rootn: str, *, tenant: str, node: str,
@@ -1050,12 +1104,20 @@ def _usn_index(db: sqlite3.Connection, rootn: str, *, tenant: str, node: str,
         if why:
             raise _UsnFallbackError(why, start)
         assert cur is not None
+        now = time.monotonic()
+        left = max(0.0, deadline - now)
         try:
-            records = list(vol.read_until(int(cur["next_usn"]), j.next_usn, j.journal_id))
-            relist, walk, denied, unresolved = _usn_plan(vol, records, rootn, j.next_usn,
-                                                         j.journal_id)
+            records, end_usn = _usn_read(vol, int(cur["next_usn"]), j.next_usn,
+                                         j.journal_id, now + left * _USN_READ_SHARE)
+            relist, walk, denied, unresolved, planned, end_usn = _usn_plan(
+                vol, records, rootn, end_usn, j.journal_id,
+                deadline=now + left * _USN_PLAN_SHARE)
         except _usn.UsnError as e:
             raise _UsnFallbackError(e.reason, start) from e
+        records = records[:planned]
+        # A window too long for one budget is replayed in chunks: this pass applies
+        # [cursor, end_usn) and saves end_usn, so the next one starts there.
+        partial = end_usn < j.next_usn
         frontier = _load_frontier(cur)
         if frontier:
             # The not-yet-walked part is walked below anyway: replaying it here would
@@ -1066,7 +1128,7 @@ def _usn_index(db: sqlite3.Connection, rootn: str, *, tenant: str, node: str,
                          st=st)
     finally:
         vol.close()
-    resumed = bool(frontier) and not res["truncated"]
+    resumed = bool(frontier) and not res["truncated"] and not partial
     if resumed:
         rfiles, _b, rerrors, rtrunc, rremoved = _walk_into(
             db, rootn, tenant=tenant, node=node, exclude=exclude, deadline=deadline, g=g,
@@ -1076,14 +1138,21 @@ def _usn_index(db: sqlite3.Connection, rootn: str, *, tenant: str, node: str,
         res["errors"] += rerrors
         res["removed"] += rremoved
         res["truncated"] = rtrunc
-    truncated = res["truncated"]
+    truncated = res["truncated"] or partial
     row = db.execute("SELECT files, bytes FROM dirs WHERE tenant = ? AND node = ? AND path = ?",
                      (tenant, node, rootn)).fetchone()
     files, total = (int(row[0]), int(row[1])) if row else (0, 0)
     with db:
         _upsert_root(db, tenant, node, rootn, files, total, scanned_at, truncated,
                      res["errors"])
-        if not truncated:   # a truncated pass keeps the old cursor and replays next time
+        if partial and not res["truncated"]:
+            # Everything before end_usn is applied: save THAT, so the replay window
+            # shrinks every pass instead of growing (#17909).
+            chunk = dict(start, next_usn=end_usn, walk_next=bool(unresolved))
+            if frontier:
+                chunk["resume"] = frontier
+            _usn_save(db, tenant, node, rootn, chunk)
+        elif not truncated:   # a truncated pass keeps the old cursor and replays next time
             _usn_save(db, tenant, node, rootn, dict(start, walk_next=bool(unresolved)))
         elif resumed and frontier:
             # The journal was replayed in full and the resumed walk got further: the
@@ -1096,7 +1165,8 @@ def _usn_index(db: sqlite3.Connection, rootn: str, *, tenant: str, node: str,
     st["roots"].append({"root": rootn, "files": files, "bytes": total,
                         "errors": res["errors"], "truncated": truncated,
                         "scanned_at": scanned_at, "mode": "usn", "usn_fallback_reason": None,
-                        "usn_records": len(records), "usn_dirs_relisted": res["relisted"],
+                        "usn_records": len(records), "usn_partial": partial,
+                        "usn_dirs_relisted": res["relisted"],
                         "usn_subtrees_walked": res["walked"], "usn_denied": denied,
                         "usn_unresolved": unresolved, "usn_walk_next": bool(unresolved),
                         "resumed": resumed,
