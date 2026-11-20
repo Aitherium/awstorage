@@ -451,7 +451,8 @@ def _cmd_files_scan(a) -> int:
             print(f"  {r['root']}: full walk (USN journal not used: {r['usn_fallback_reason']})")
     print(f"  hashed: {st['partial_hashed']} partial, {st['full_hashed']} full, "
           f"{human(st['bytes_read'])} read"
-          + (f"  [hash budget spent; {human(st['bytes_remaining'])} still unhashed]"
+          + ("  [hash skipped: too little of the budget left]" if st.get("hash_skipped")
+             else f"  [hash budget spent; {human(st['bytes_remaining'])} still unhashed]"
              if st["hash_truncated"] else ""))
     return 0
 

@@ -631,15 +631,21 @@ def _walk(root: str, exclude: set[str], deadline: float,
 
     `stack`, when given, is the walk's OWN to-visit list (mutated in place): seed it
     with a saved frontier to resume, and after a TimeoutError it holds exactly the
-    directories not yet listed -- the deadline is checked only between directories,
-    so every listed directory's files have been yielded. `listed(dir, files, subdirs)`
+    directories not yet listed -- the deadline is checked between directories and,
+    once one directory is done, after each yielded file; a directory cut mid-way goes
+    back on the stack whole, so every directory NOT on it has had all its files
+    yielded. `listed(dir, files, subdirs)`
     is called once per listed directory with the normalised paths the walk kept."""
     if stack is None:
         stack = [[root, git_root]]
+    done_dirs = 0
     while stack:
         if time.monotonic() >= deadline:
             raise TimeoutError
-        d, git_root = stack.pop()
+        item = stack.pop()
+        d, git_root = item
+        n_pushed = 0
+        cut = False
         try:
             with os.scandir(d) as it:
                 entries = list(it)
@@ -661,6 +667,7 @@ def _walk(root: str, exclude: set[str], deadline: float,
                     if skip_dir is not None and skip_dir(norm_path(e.path)):
                         continue
                     stack.append([e.path, git_root])
+                    n_pushed += 1
                     kept_dirs.add(norm_path(e.path))
                 elif stat_mod.S_ISREG(st.st_mode):
                     # Windows DirEntry.stat() leaves dev/ino/nlink 0: filled at hash time.
@@ -668,10 +675,26 @@ def _walk(root: str, exclude: set[str], deadline: float,
                     kept_files.add(p)
                     yield (p, int(st.st_size), int(st.st_mtime_ns),
                            _nz(st.st_dev), _nz(st.st_ino), _nz(st.st_nlink), git_root)
+                    # The consumer's batch flush runs inside that yield; on a large index
+                    # one flush can take a minute, so a directory with many files could
+                    # run far past the deadline (#17973). Once this pass has finished at
+                    # least one directory (so every pass makes progress), cut here and
+                    # put the directory back: it is re-listed whole next time, and the
+                    # rows already written are idempotent upserts.
+                    if done_dirs and time.monotonic() >= deadline:
+                        cut = True
+                        break
             except OSError:
                 yield None
+        if cut:
+            # Raised OUTSIDE the per-entry `except OSError` (TimeoutError subclasses it).
+            if n_pushed:
+                del stack[-n_pushed:]
+            stack.append(item)
+            raise TimeoutError
         if listed is not None:
             listed(norm_path(d), kept_files, kept_dirs)
+        done_dirs += 1
 
 
 def _new_stats(node: str, tenant: str) -> dict:
@@ -1346,11 +1369,18 @@ def hash_node(db: sqlite3.Connection, node: str, *, tenant: str = PLATFORM_TENAN
               partial_bytes: int = PARTIAL_BYTES, time_budget_s: float = 3600.0,
               budget_bytes: int = DEFAULT_HASH_BUDGET_BYTES, workers: int = HASH_WORKERS,
               stats: dict | None = None,
-              progress: Callable[[dict], None] | None = None) -> dict:
+              progress: Callable[[dict], None] | None = None,
+              min_left_s: float = 0.0) -> dict:
     """Fill hashes for rows that lack them (auto: size bucket -> partial -> sha256;
     full: sha256 everything >= min_bytes; none: nothing). Bounded by time AND bytes
     read; reports hash_truncated and bytes_remaining. Rows that already carry a hash
-    are never re-read."""
+    are never re-read.
+
+    Each stage's first page, the bytes_remaining aggregate and the per-root hashed_pct
+    are whole-index SQL that ignores the deadline; on a 20M-row index they take minutes.
+    With `min_left_s` > 0, every one of them is skipped once fewer than that many
+    seconds are left (`hash_skipped` names the reason; bytes_remaining is then NOT
+    measured and stays at its prior value)."""
     if mode not in HASH_MODES:
         raise ValueError(f"hash mode must be one of {HASH_MODES}, not {mode!r}")
     st = stats if stats is not None else _new_stats(node, tenant)
@@ -1358,6 +1388,16 @@ def hash_node(db: sqlite3.Connection, node: str, *, tenant: str = PLATFORM_TENAN
         return st
     deadline = time.monotonic() + float(time_budget_s)
     tick = [time.monotonic()]
+
+    def short() -> bool:
+        if min_left_s > 0 and deadline - time.monotonic() < min_left_s:
+            st["hash_truncated"] = True
+            st["hash_skipped"] = "budget_left_below_min"
+            return True
+        return False
+
+    if short():
+        return st
 
     def stage(where: str, args: list, full: bool) -> None:
         after = ""
@@ -1421,6 +1461,8 @@ def hash_node(db: sqlite3.Connection, node: str, *, tenant: str = PLATFORM_TENAN
     if mode == "full":
         where = "sha256 IS NULL AND bytes >= ?"
         stage(where, [min_bytes], True)
+        if short():
+            return st
         remaining = db.execute(
             "SELECT COALESCE(SUM(bytes), 0) FROM files WHERE tenant = ? AND node = ? AND "
             + where, (tenant, node, min_bytes)).fetchone()[0]
@@ -1428,9 +1470,13 @@ def hash_node(db: sqlite3.Connection, node: str, *, tenant: str = PLATFORM_TENAN
         w1 = "partial_hash IS NULL AND bytes >= ? AND " + size_bucket
         a1 = [min_bytes, tenant, node, min_bytes]
         stage(w1, a1, False)
+        if short():
+            return st
         w2 = "sha256 IS NULL AND partial_hash IS NOT NULL AND " + partial_collide
         a2 = [tenant, node]
         stage(w2, a2, True)
+        if short():
+            return st
         remaining = sum(db.execute(
             "SELECT COALESCE(SUM(bytes), 0) FROM files WHERE tenant = ? AND node = ? AND " + w,
             [tenant, node, *a]).fetchone()[0] for w, a in ((w1, a1), (w2, a2)))
@@ -1540,6 +1586,27 @@ def hash_paths(db: sqlite3.Connection, node: str, paths: Iterable[str], *,
     return st
 
 
+# Below this many seconds left (clamped to half the call's budget), scan_files skips
+# hashing: its whole-index SQL ignores deadlines.
+HASH_MIN_LEFT_S = 60.0
+
+
+def _rotate_roots(db: sqlite3.Connection, roots: list, *, tenant: str, node: str) -> list:
+    """`roots` rotated by a per-(tenant, node) counter kept in `meta`, bumped per call."""
+    if len(roots) < 2:
+        return roots
+    key = f"scan_rotation|{tenant}|{node}"
+    row = db.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
+    try:
+        n = int(row[0]) if row else 0
+    except ValueError:
+        n = 0
+    with db:
+        db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)", (key, str(n + 1)))
+    i = n % len(roots)
+    return roots[i:] + roots[:i]
+
+
 def scan_files(db: sqlite3.Connection, roots: Iterable[str | os.PathLike], *, node: str,
                tenant: str = PLATFORM_TENANT, hash_mode: str = "auto",
                time_budget_s: float = 3600.0, min_hash_bytes: int = DEFAULT_MIN_HASH_BYTES,
@@ -1547,20 +1614,27 @@ def scan_files(db: sqlite3.Connection, roots: Iterable[str | os.PathLike], *, no
                exclude_dirs: Iterable[str] | None = None, guards: _guards.Guards | None = None,
                skip_never_dirs: bool = False,
                progress: Callable[[dict], None] | None = None) -> dict:
-    """Index every root, then hash per `hash_mode`. The whole call shares one budget."""
+    """Index every root, then hash per `hash_mode`. The whole call shares one budget.
+
+    Roots run in the given order rotated by a persistent per-(tenant, node) counter in
+    `meta` that advances by one each call (taken modulo the current list length), so
+    a root that eats the budget does not leave the same later roots with 0 s on every
+    pass. Hashing is skipped outright when fewer than HASH_MIN_LEFT_S remain: its
+    whole-index SQL would otherwise run past the caller's budget (#17973)."""
     if hash_mode not in HASH_MODES:
         raise ValueError(f"hash mode must be one of {HASH_MODES}, not {hash_mode!r}")
     t0 = time.monotonic()
     st = _new_stats(node, tenant)
     g = guards or _guards.Guards()
-    for r in roots:
+    for r in _rotate_roots(db, list(roots), tenant=tenant, node=node):
         left = max(0.0, float(time_budget_s) - (time.monotonic() - t0))
         index_root(db, r, node=node, tenant=tenant, time_budget_s=left,
                    exclude_dirs=exclude_dirs, guards=g, skip_never_dirs=skip_never_dirs,
                    stats=st, progress=progress)
     left = max(0.0, float(time_budget_s) - (time.monotonic() - t0))
     hash_node(db, node, tenant=tenant, mode=hash_mode, min_bytes=min_hash_bytes,
-              time_budget_s=left, budget_bytes=hash_budget_bytes, stats=st, progress=progress)
+              time_budget_s=left, budget_bytes=hash_budget_bytes, stats=st, progress=progress,
+              min_left_s=min(HASH_MIN_LEFT_S, float(time_budget_s) / 2))
     st["elapsed_s"] = round(time.monotonic() - t0, 3)
     return st
 
