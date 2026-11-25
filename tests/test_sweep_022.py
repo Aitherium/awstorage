@@ -18,7 +18,7 @@ from pathlib import Path
 
 import awstorage
 import pytest
-from awstorage._fs import is_busy_error, remove_tree, remove_tree_detail
+from awstorage._fs import _force, _is_not_empty, is_busy_error, remove_tree, remove_tree_detail
 from awstorage.catalog import Catalog
 from awstorage.policy import list_quarantine
 
@@ -121,12 +121,56 @@ def test_remove_tree_detail_splits_busy_from_errors(tmp_path: Path, monkeypatch)
     assert removed >= 50_000 and lock.exists() and not (item / "big.bin").exists()
     # the lockfile itself, then its dirs left non-empty BECAUSE of it
     assert busy and "lockfile" in busy[0]
-    assert any("holds a busy file" in b for b in busy)
+    assert any("holds a child that did not go" in b for b in busy)
     # the compat API still reports it (policy.apply treats any leftover as failed)
     _mk(item / "again.bin", b"y", 30)
     with held(lock, monkeypatch):
         _r, errs2 = remove_tree(item)
     assert errs2 and any("lockfile" in e for e in errs2)
+
+
+def test_force_reraises_the_first_denial_not_the_not_empty_retry(tmp_path: Path):
+    """A protected parent must read as busy, not as a new fault.
+
+    Measured 2026-11-25: one quarantine entry held a skilltask `.git/objects` tree
+    whose files belong to another account. Every rmdir raised PermissionError, the
+    read-only retry then raised ERROR_DIR_NOT_EMPTY, and the sweep called THAT the
+    failure -- 280 consecutive red wakes on a condition it cannot fix without
+    elevation. The first exception is the one to classify.
+    """
+    calls = {"n": 0}
+    target = tmp_path / "objects"
+    target.mkdir()  # _force chmods the real path between the two calls
+
+    def fn(path: str) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(errno.EACCES, "denied", path)
+        raise OSError(errno.ENOTEMPTY, "not empty", path)
+
+    with pytest.raises(PermissionError) as caught:
+        _force(fn, str(target))
+    assert calls["n"] == 2, "the chmod + single retry still happened"
+    assert is_busy_error(caught.value), "the caller must classify this as busy"
+    assert not _is_not_empty(caught.value)
+
+
+def test_force_still_surfaces_a_real_retry_failure(tmp_path: Path):
+    """A retry that fails for a reason that is NOT 'still non-empty' stays an error."""
+    calls = {"n": 0}
+    target = tmp_path / "x"
+    target.write_bytes(b"x")
+
+    def fn(path: str) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(errno.EACCES, "denied", path)
+        raise OSError(errno.EIO, "io", path)
+
+    with pytest.raises(OSError) as caught:
+        _force(fn, str(target))
+    assert not isinstance(caught.value, PermissionError)
+    assert not is_busy_error(caught.value)
 
 
 # -- the sweep ---------------------------------------------------------------------

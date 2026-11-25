@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.10.6] - 2026-11-25
+
+### Fixed
+
+- **awstorage**: a protected directory left non-empty by its unremovable children now
+  reports the FIRST PermissionError (busy, retried next pass) instead of the retry's
+  ERROR_DIR_NOT_EMPTY, which read as a new fault and failed every sweep of a quarantine
+  entry owned by another account (measured: 280 consecutive red wakes on one
+  `.git/objects` tree).
+
 ## [0.10.5] - 2026-11-24
 
 ### Fixed

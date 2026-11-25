@@ -310,10 +310,22 @@ def unlink_link(path: str) -> None:
 def _force(fn, path: str) -> None:
     try:
         fn(path)
-    except PermissionError:
+    except PermissionError as first:
         # Read-only bit on Windows; clear it and retry once.
         os.chmod(path, stat.S_IWRITE)
-        fn(path)
+        try:
+            fn(path)
+        except OSError as retry_exc:
+            if _is_not_empty(retry_exc):
+                # A directory left non-empty because a child could not go (an
+                # ACL-protected file, another account's tree). Reporting the retry's
+                # ERROR_DIR_NOT_EMPTY wears the mask of a NEW fault and turned every
+                # sweep of a protected quarantine entry red (measured 2026-11-25:
+                # 280 consecutive failures on one .git/objects tree). The FIRST
+                # failure is the truth: the caller classifies PermissionError as
+                # busy, which keeps the entry for the next pass without failing.
+                raise first from retry_exc
+            raise
 
 
 def walk_no_follow(root: str | os.PathLike):
@@ -437,8 +449,14 @@ def remove_tree_detail(path: str | os.PathLike) -> tuple[int, list[str], list[st
         try:
             _force(os.rmdir, d)
         except OSError as exc:
-            if _is_not_empty(exc) and any(_under(b, d) for b in busy_paths):
-                busy.append(f"{d}: kept, holds a busy file")
+            if _is_not_empty(exc):
+                # After every child was attempted, a directory is non-empty ONLY
+                # because a child did not go -- and that child is already recorded
+                # (busy, or a real error). The parent's ERROR_DIR_NOT_EMPTY is a
+                # consequence, never an independent fault: classifying it as one made
+                # a protected .git/objects tree fail 280 sweeps in a row without ever
+                # naming something new. Busy keeps the entry for the next pass.
+                busy.append(f"{d}: kept, holds a child that did not go")
                 busy_paths.append(d)
             else:
                 fail(d, exc)
