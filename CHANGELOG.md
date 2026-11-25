@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.10.5] - 2026-11-24
+
+### Fixed
+
+- **awstorage**: file-index scan stops at its budget (#17973) (#17976) (19c8042398)
+- **awstorage**: bound the USN journal replay by the pass budget (#17909) (#17915) (0f4778ca99)
+- **awstorage**: file index resumes a walk too big for one budget; each sync step gets its own timeout (#17690) (#17703) (2922ee17b8)
+- **awstorage**: incremental_vacuum frees pages only when stepped (0.10.3) (#15528) (c3330338bb)
+- **awstorage**: stop indexing agent worktrees; files forget drops them (0.10.2) (#15522) (fb9cb369f5)
+- **awstorage**: re-apply the moat-guard literal fix reverted by #15350 (#15356) (a71b4fd2d6)
+
 ## 0.10.1 -- 2026-11-07
 
 - Test fixtures no longer carry internal container names, so the sdist passes the publish guard.
